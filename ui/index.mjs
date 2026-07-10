@@ -1,209 +1,522 @@
-// Select to Edit — dashboard page (federated ESM, no build step).
-// Loaded by AppHost via import('/apps/poke-and-prose/ui/index.mjs').
-// Resolves React + app-sdk + icons from the host import map (window.__kiroclaw_modules),
-// exactly like the shipping demo-app / agent-worlds apps.
+// Poke & Prose — dashboard page (federated ESM, no build step).
+// Design source: Figma "Michelle Playground" frame 232:2123 (see design/).
+// Two-panel layout inside KiroClaw's content area: 450px left rail + preview.
 
 const React = window.__kiroclaw_modules.react
 const { useAppApi, useChatLauncher } = window.__kiroclaw_modules['@kiroclaw/app-sdk']
-const { MousePointerClick, RefreshCw, Send } = window.__kiroclaw_modules['lucide-react']
+const {
+  MousePointerClick, RefreshCw, ChevronDown, ChevronRight,
+  Send, Folder, Plus, Monitor, Eye, Pencil, History: HistoryIcon, X,
+} = window.__kiroclaw_modules['lucide-react']
 
 const { useState, useEffect, useCallback, useRef, createElement: h } = React
 
-const API_BASE = '/apps/poke-and-prose/api'
-const LS_KEY = 'ste_active_url'  // persist the active preview target across navigation
+// lucide dropped brand icons — inline GitHub mark instead.
+function GithubIcon({ size = 16 }) {
+  return h('svg', {
+    width: size, height: size, viewBox: '0 0 24 24',
+    fill: 'currentColor', 'aria-hidden': true,
+  }, h('path', {
+    d: 'M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.55v-2.17c-3.2.7-3.87-1.36-3.87-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.19 1.76 1.19 1.03 1.75 2.69 1.25 3.34.95.1-.74.4-1.25.72-1.53-2.55-.29-5.23-1.28-5.23-5.68 0-1.26.45-2.29 1.19-3.09-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11.1 11.1 0 0 1 5.79 0c2.2-1.49 3.17-1.18 3.17-1.18.63 1.59.23 2.76.12 3.05.74.8 1.18 1.83 1.18 3.09 0 4.42-2.69 5.39-5.25 5.67.41.35.77 1.04.77 2.1v3.12c0 .3.21.66.8.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z',
+  }))
+}
 
-function StatCard({ label, value, accent }) {
-  return h('div', { className: 'bg-card rounded-md px-4 py-3.5 border border-border shadow-[inset_0_1px_0_var(--card-hl)]' },
-    h('div', { className: 'text-muted text-[13px] font-medium uppercase tracking-[.04em]' }, label),
-    h('div', { className: `text-2xl font-bold mt-1.5 tracking-tight leading-none ${accent ? 'text-accent' : ''}` }, String(value ?? '—')),
+const API_BASE = '/apps/poke-and-prose/api'
+const DIMS = { desktop: '100%', tablet: '768px', mobile: '390px' }
+
+function timeAgo(iso) {
+  if (!iso) return ''
+  const s = Math.max(0, (Date.now() - Date.parse(iso)) / 1000)
+  if (s < 60) return 'just now'
+  if (s < 3600) return `${Math.round(s / 60)} min ago`
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`
+  return `${Math.round(s / 86400)} d ago`
+}
+
+const CHIP = {
+  new:  { label: 'new',        fg: 'var(--warn)',   bg: 'var(--warn-subtle)' },
+  sent: { label: 'in progress', fg: 'var(--accent)', bg: 'var(--accent-subtle)' },
+  done: { label: 'done',       fg: 'var(--ok)',     bg: 'var(--ok-subtle)' },
+}
+
+function Chip({ status }) {
+  const c = CHIP[status] || CHIP.new
+  return h('span', {
+    className: 'text-[11px] px-2 py-[2px] rounded-full font-medium',
+    style: { color: c.fg, background: c.bg },
+  }, c.label)
+}
+
+function RequestCard({ item, done, onSend }) {
+  return h('div', { className: 'py-2 border-b border-border/60' },
+    h('div', { className: 'flex items-center gap-1 text-[11px] text-muted' },
+      h('span', null, `#${item.number || '—'}`),
+      h('span', null, '·'),
+      h('span', { className: 'text-[12px]' }, item.element || `${item.count} elements`),
+      !done && item.status === 'new' &&
+        h('span', { className: 'w-[6px] h-[6px] rounded-full ml-1', style: { background: 'var(--danger)' } }),
+    ),
+    h('div', {
+      className: 'text-[13px] text-text mt-0.5',
+      style: { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
+    }, item.comment),
+    h('div', { className: 'flex items-center gap-2 mt-1.5' },
+      h('span', { className: 'text-[12px] text-muted' }, `Updated ${timeAgo(item.createdAt)}`),
+      h(Chip, { status: done ? 'done' : item.status }),
+      h('span', { className: 'flex-1' }),
+      !done && h('button', {
+        title: 'Send to agent',
+        onClick: () => onSend(item),
+        className: 'p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+      }, h(Send, { size: 14 })),
+    ),
   )
 }
 
-function SelectToEdit() {
+export default function PokeAndProse() {
   const api = useAppApi()
   const { openChat } = useChatLauncher()
-  const [url, setUrl] = useState('')
-  const [loadedUrl, setLoadedUrl] = useState('')
+
+  const [projects, setProjects] = useState([])
+  const [activeId, setActiveId] = useState('')     // backend: which project is served
+  const [selectedId, setSelectedId] = useState('') // UI: which project is picked in dropdown
+  const [serving, setServing] = useState(false)
+  const [repoUrl, setRepoUrl] = useState('')
+  const [ddOpen, setDdOpen] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [newPath, setNewPath] = useState('')
+  const [tab, setTab] = useState('requests')
   const [pending, setPending] = useState([])
+  const [history, setHistory] = useState([])
+  const [histOpen, setHistOpen] = useState(false)
+  const [previewId, setPreviewId] = useState('')
+  const [previewNonce, setPreviewNonce] = useState(1)
+  // Dimensions are a per-app preference (keyed by project id, persisted).
+  const [dimsMap, setDimsMap] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('ste_dims_map')) || {} } catch { return {} }
+  })
+  const [dimsOpen, setDimsOpen] = useState(false)
+  const dims = dimsMap[previewId] || 'desktop'
+  const setDimsFor = useCallback((pid, k) => {
+    if (!pid) return
+    setDimsMap((m) => {
+      const next = { ...m, [pid]: k }
+      try { localStorage.setItem('ste_dims_map', JSON.stringify(next)) } catch { /* ignore */ }
+      return next
+    })
+  }, [])
+  const [mode, setMode] = useState('preview')
   const [status, setStatus] = useState('')
   const iframeRef = useRef(null)
 
-  const refreshQueue = useCallback(async () => {
-    try {
-      const data = await api.get(`${API_BASE}/queue`)
-      setPending(Array.isArray(data?.pending) ? data.pending : [])
-    } catch {
-      /* backend may still be warming up */
+  // Resizable left rail — default 500px, persisted, clamped 360–800.
+  const [railW, setRailW] = useState(() => {
+    try { return Math.min(800, Math.max(360, parseInt(localStorage.getItem('ste_rail_w'), 10) || 500)) }
+    catch { return 500 }
+  })
+  const dragRef = useRef(null)
+  const onDragStart = useCallback((e) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = railW
+    const onMove = (ev) => {
+      const w = Math.min(800, Math.max(360, startW + (ev.clientX - startX)))
+      setRailW(w)
     }
+    const onUp = (ev) => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      const w = Math.min(800, Math.max(360, startW + (ev.clientX - startX)))
+      try { localStorage.setItem('ste_rail_w', String(w)) } catch { /* ignore */ }
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [railW])
+
+  const selected = projects.find((p) => p.id === selectedId)
+  const connected = !!previewId && previewId === selectedId
+
+  const refresh = useCallback(async () => {
+    try {
+      const d = await api.get(`${API_BASE}/projects`)
+      setProjects(d.projects || [])
+      setActiveId(d.activeId || '')
+      setServing(!!d.serving)
+      setRepoUrl(d.repoUrl || '')
+      setSelectedId((cur) => cur || d.activeId || (d.projects?.[0]?.id ?? ''))
+      // Restore the last previewed project across visits/restarts — unless the
+      // user explicitly disconnected.
+      let wasDisconnected = false
+      try { wasDisconnected = localStorage.getItem('ste_disconnected') === '1' } catch { /* ignore */ }
+      if (d.activeId && !wasDisconnected) setPreviewId((cur) => cur || d.activeId)
+    } catch { /* backend warming up */ }
+    try {
+      const q = await api.get(`${API_BASE}/queue`)
+      setPending(Array.isArray(q?.pending) ? q.pending : [])
+    } catch { /* ignore */ }
+    try {
+      const hh = await api.get(`${API_BASE}/history`)
+      setHistory(Array.isArray(hh?.history) ? hh.history : [])
+    } catch { /* ignore */ }
   }, [api])
 
-  // Poll the queue.
   useEffect(() => {
-    refreshQueue()
-    const t = setInterval(refreshQueue, 4000)
+    refresh()
+    const t = setInterval(refresh, 5000)
     return () => clearInterval(t)
-  }, [refreshQueue])
+  }, [refresh])
 
-  // Receive selections postMessage'd from the injected script inside the iframe.
+  // Captures from the overlay inside the iframe.
   useEffect(() => {
     async function onMsg(e) {
       const d = e?.data
       if (!d || d.source !== 'kiro-select-to-edit' || !d.payload) return
       try {
         const out = await api.post(`${API_BASE}/submit`, d.payload)
-        if (out?.ok) {
-          setStatus(`Captured "${d.payload.comment}" → queued (${out.id})`)
-          refreshQueue()
-        } else {
-          setStatus(`Capture failed: ${out?.error || 'unknown error'}`)
-        }
-      } catch (err) {
-        setStatus(`Capture failed: ${err?.message || err}`)
-      }
+        setStatus(out?.ok ? `Captured "${d.payload.comment}"` : `Capture failed: ${out?.error}`)
+        refresh()
+      } catch (err) { setStatus(`Capture failed: ${err?.message || err}`) }
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
-  }, [api, refreshQueue])
+  }, [api, refresh])
 
-  const startPreview = useCallback(async (target) => {
-    const u = (target || url || '').trim()
-    if (!u) return
-    try {
-      const out = await api.post(`${API_BASE}/source`, { value: u })
-      if (out?.ok) {
-        // Same-origin proxy URL — satisfies the dashboard CSP (frame-src 'self').
-        setLoadedUrl(`${API_BASE}/proxy/?_t=${Date.now()}`)
-        try { localStorage.setItem(LS_KEY, u) } catch { /* ignore */ }
-        setStatus(out.mode === 'folder'
-          ? `Serving folder ${out.root} — overlay injected; edits will target this project.`
-          : `Proxying ${out.target || u} — overlay injected.`)
-      } else {
-        setStatus(`View failed: ${out?.error || 'unknown error'}`)
-      }
-    } catch (err) {
-      setStatus(`View failed: ${err?.message || err}`)
-    }
-  }, [api, url])
+  const switchTo = useCallback((p) => {
+    if (!p) return
+    setSelectedId(p.id)
+    setPreviewId(p.id)               // instant — all projects are always served
+    setPreviewNonce(Date.now())
+    setMode('preview')
+    setStatus('')
+    try { localStorage.removeItem('ste_disconnected') } catch { /* ignore */ }
+    // Persist as the "last previewed" so it restores after a restart.
+    api.post(`${API_BASE}/projects/select`, { id: p.id }).catch(() => {})
+  }, [api])
 
-  const endPreview = useCallback(() => {
-    setLoadedUrl('')
-    try { localStorage.removeItem(LS_KEY) } catch { /* ignore */ }
-    setStatus('Preview ended.')
+  const connect = useCallback(() => switchTo(selected), [switchTo, selected])
+
+  const disconnect = useCallback(() => {
+    setPreviewId('')
+    setStatus('')
+    try { localStorage.setItem('ste_disconnected', '1') } catch { /* ignore */ }
   }, [])
 
-  // Restore the preview after navigating away and back (the page remounts and
-  // loses React state, but the backend proxy target + localStorage let us re-arm).
-  useEffect(() => {
-    let saved = ''
-    try { saved = localStorage.getItem(LS_KEY) || '' } catch { /* ignore */ }
-    if (saved) {
-      setUrl(saved)
-      startPreview(saved)
-    }
-    // run once on mount
-  }, []) // eslint-disable-line
+  const [hoverPid, setHoverPid] = useState('')
+  const removeProject = useCallback(async (p) => {
+    try {
+      const out = await api.post(`${API_BASE}/projects/remove`, { id: p.id })
+      if (out?.ok) {
+        if (previewId === p.id) setPreviewId('')
+        setSelectedId((cur) => (cur === p.id ? '' : cur))
+        refresh()
+      } else setStatus(`Remove failed: ${out?.error || 'unknown'}`)
+    } catch (err) { setStatus(`Remove failed: ${err?.message || err}`) }
+  }, [api, previewId, refresh])
 
-  const applyLatest = useCallback(() => {
-    const latest = pending[pending.length - 1]
-    if (!latest) return
+  const addProject = useCallback(async (pathArg) => {
+    const p = (pathArg || newPath).trim()
+    if (!p) return
+    try {
+      const out = await api.post(`${API_BASE}/projects`, { path: p })
+      if (out?.ok) {
+        setNewPath(''); setAdding(false); setDdOpen(false)
+        switchTo(out.project)   // newly added apps preview immediately
+        refresh()
+        setStatus(out.existing ? `Already registered — switched to ${out.project.name}.` : `Added ${out.project.name} — previewing.`)
+      } else setStatus(`Add failed: ${out?.error}`)
+    } catch (err) { setStatus(`Add failed: ${err?.message || err}`) }
+  }, [api, newPath, refresh, switchTo])
+
+  const pickFolder = useCallback(async () => {
+    setStatus('Opening folder picker… (check your Mac for the dialog)')
+    try {
+      const out = await api.post(`${API_BASE}/pick-folder`, {})
+      if (out?.ok && out.path) {
+        setStatus('')
+        addProject(out.path)
+      } else if (out?.canceled) {
+        setStatus('')
+      } else {
+        // picker unavailable (permission denied / non-mac) — fall back to typing
+        setAdding(true)
+        setStatus(`Picker unavailable (${out?.error || 'unknown'}) — type the path instead.`)
+      }
+    } catch (err) {
+      setAdding(true)
+      setStatus(`Picker unavailable (${err?.message || err}) — type the path instead.`)
+    }
+  }, [api, addProject])
+
+  const selfUpdate = useCallback(async () => {
+    setStatus('Pulling latest from GitHub…')
+    try {
+      const out = await api.post(`${API_BASE}/self-update`, {})
+      setStatus(out?.ok ? `Updated to v${out.version}. ${out.note}` : `Update failed: ${out?.error}`)
+    } catch (err) { setStatus(`Update failed: ${err?.message || err}`) }
+  }, [api])
+
+  const sendToAgent = useCallback((item) => {
     const msg =
-      `Apply the pending Select-to-Edit request (id ${latest.id}): "${latest.comment}". ` +
-      `Read the payload at ~/.kiroclaw/apps/poke-and-prose/data/queue/${latest.id}.json — ` +
-      `it includes projectRoot and sourceFile, so edit that file directly (no searching), ` +
-      `then clear the request (POST ${API_BASE}/clear?id=${latest.id}).`
+      `Apply the pending Poke & Prose edit request (id ${item.id}, #${item.number}): "${item.comment}". ` +
+      `Read the payload at ~/.kiroclaw/apps/poke-and-prose/data/queue/${item.id}.json — it includes ` +
+      `projectRoot and sourceFile, so edit that file directly (no searching), then clear the request ` +
+      `(POST ${API_BASE}/clear?id=${item.id}).`
     try {
       openChat({ message: msg })
-      setStatus(`Sent request ${latest.id} to the agent.`)
-    } catch {
-      setStatus('Copy this into chat: ' + msg)
-    }
-  }, [openChat, pending])
+      api.post(`${API_BASE}/mark-sent?id=${item.id}`, {}).catch(() => {})
+      setStatus(`Sent #${item.number} to the agent.`)
+      refresh()
+    } catch { setStatus('Copy this into chat: ' + msg) }
+  }, [api, openChat, refresh])
 
-  return h('div', { className: 'flex flex-col h-full min-h-0' },
-    // Header
-    h('div', { className: 'px-6 pt-4 pb-3 flex items-end justify-between gap-4' },
-      h('div', null,
-        h('div', { className: 'text-2xl font-bold tracking-tight text-text-strong flex items-center gap-2' },
-          h(MousePointerClick, { size: 22 }), 'Poke & Prose'),
-        h('div', { className: 'text-muted text-sm mt-1' },
-          'Point at elements in your live app; type a comment; the agent edits the source.'),
+  const setEditMode = useCallback((m) => {
+    setMode(m)
+    try {
+      // Resolve the live theme tokens so the in-page overlay matches KiroClaw.
+      const cs = getComputedStyle(document.documentElement)
+      const theme = {
+        accent: cs.getPropertyValue('--accent').trim(),
+        panel: cs.getPropertyValue('--panel').trim(),
+        text: cs.getPropertyValue('--text').trim(),
+        border: cs.getPropertyValue('--border').trim(),
+        info: cs.getPropertyValue('--info').trim(),
+      }
+      iframeRef.current?.contentWindow?.postMessage(
+        { source: 'kiro-ste-host', editMode: m === 'edit', theme }, '*')
+    } catch { /* iframe not ready */ }
+  }, [])
+
+  // ---------- render ----------
+  const segBtn = (active) =>
+    `flex-1 flex items-center justify-center gap-1.5 h-8 text-[13px] font-bold cursor-pointer transition-all ${
+      active ? 'text-accent-fg' : 'text-muted hover:text-text'}`
+  const segStyle = (active) =>
+    active ? { background: 'var(--accent)', borderRadius: '12px' } : { borderRadius: '12px' }
+
+  return h('div', { className: 'flex h-full min-h-0', style: { padding: '12px' } },
+
+    // ================= LEFT RAIL (resizable, bordered container) =================
+    h('div', {
+      className: 'shrink-0 flex flex-col min-h-0',
+      style: {
+        width: `${railW}px`,
+        border: '1px solid var(--border)',
+        borderRadius: '16px',
+        overflow: 'hidden',
+      },
+    },
+
+      // header
+      h('div', { className: 'flex items-start gap-3 px-5 pt-4 pb-2' },
+        h('div', { className: 'flex-1 min-w-0' },
+          h('div', { className: 'text-[20px] font-bold text-text-strong leading-tight' }, 'Poke & Prose'),
+          h('div', { className: 'text-[12px] text-muted mt-0.5' }, 'Point, describe, and watch the code catch up.'),
+        ),
+        h('button', {
+          title: 'Sync: pull latest app version from GitHub', onClick: selfUpdate,
+          className: 'p-2 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+        }, h(RefreshCw, { size: 16 })),
+        h('button', {
+          title: 'Open app repo on GitHub',
+          onClick: () => repoUrl && window.open(repoUrl, '_blank', 'noopener'),
+          className: 'p-2 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+        }, h(GithubIcon, { size: 16 })),
       ),
-      h('button', {
-        className: 'px-2.5 py-1 rounded-md border border-border bg-transparent text-muted hover:text-text hover:border-border-strong text-[13px] cursor-pointer transition-all inline-flex items-center gap-1.5',
-        onClick: refreshQueue,
-      }, h(RefreshCw, { size: 14 }), 'Refresh'),
+
+      // project dropdown + connect
+      h('div', { className: 'flex items-center gap-3 px-5 py-2 relative' },
+        h('button', {
+          onClick: () => { setDdOpen(!ddOpen); setAdding(false) },
+          className: 'flex-1 min-w-0 flex items-center gap-2 h-10 px-3 rounded-xl bg-bg-elevated border border-border text-[13px] font-bold text-text cursor-pointer',
+        },
+          h(Folder, { size: 16, className: 'shrink-0 text-muted' }),
+          h('span', { className: 'truncate' }, selected ? selected.name : 'Select a web app…'),
+          h(ChevronDown, { size: 16, className: 'ml-auto shrink-0 text-muted' }),
+        ),
+        connected
+          ? h('button', {
+              onClick: disconnect,
+              title: 'Click again to disconnect',
+              className: 'h-10 px-4 text-[13px] font-bold text-text cursor-pointer hover:bg-bg-elevated',
+              style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: '12px' },
+            }, 'Connected')
+          : h('button', {
+              onClick: connect, disabled: !selected,
+              className: 'h-10 px-4 bg-accent text-accent-fg text-[13px] font-bold cursor-pointer disabled:opacity-40',
+              style: { borderRadius: '12px' },
+            }, 'Connect'),
+
+        // dropdown panel
+        ddOpen && h('div', {
+          className: 'absolute left-5 right-5 top-[52px] z-20 rounded-xl border border-border bg-card shadow-lg overflow-hidden',
+        },
+          // scrollable list: 4.5 items visible (item ≈ 40px → 180px)
+          h('div', { style: { maxHeight: '180px', overflowY: 'auto' } },
+            projects.length === 0
+              ? h('div', { className: 'px-3 py-3 text-[13px] text-muted' }, 'No web apps loaded yet.')
+              : projects.map((p) => h('div', {
+                  key: p.id,
+                  onClick: () => { switchTo(p); setDdOpen(false) },
+                  onMouseEnter: () => setHoverPid(p.id),
+                  onMouseLeave: () => setHoverPid(''),
+                  className: `w-full flex items-center gap-2 h-10 px-3 text-left text-[13px] cursor-pointer hover:bg-bg-elevated ${p.id === selectedId ? 'text-text font-bold' : 'text-muted'}`,
+                },
+                  h(Folder, { size: 14 }),
+                  h('span', { className: 'truncate flex-1' }, p.name),
+                  hoverPid === p.id && h('button', {
+                    title: 'Remove from list',
+                    onClick: (e) => { e.stopPropagation(); removeProject(p) },
+                    className: 'flex items-center justify-center text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+                    style: { width: '22px', height: '22px', borderRadius: '6px' },
+                  }, h(X, { size: 14 })),
+                )),
+          ),
+          // pinned below the scroll area
+          h('div', { className: 'border-t border-border' },
+            adding
+              ? h('div', { className: 'flex items-center gap-2 p-2' },
+                  h('input', {
+                    value: newPath, autoFocus: true,
+                    onChange: (e) => setNewPath(e.target.value),
+                    onKeyDown: (e) => e.key === 'Enter' && addProject(),
+                    placeholder: '/Users/you/Developer/my-app',
+                    className: 'flex-1 h-8 px-2 rounded-md bg-bg-elevated border border-border text-[12px] text-text',
+                  }),
+                  h('button', { onClick: () => addProject(), className: 'h-8 px-3 rounded-md bg-accent text-accent-fg text-[12px] font-bold cursor-pointer' }, 'Add'),
+                )
+              : h('button', {
+                  onClick: pickFolder,
+                  title: 'Opens the macOS folder chooser',
+                  className: 'w-full flex items-center gap-2 h-10 px-3 text-[13px] text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+                }, h(Plus, { size: 14 }), 'load new app'),
+          ),
+        ),
+      ),
+
+      // tabs
+      h('div', { className: 'px-5 py-2' },
+        h('div', { className: 'flex p-1 rounded-2xl bg-bg-elevated border border-border' },
+          h('button', {
+            onClick: () => setTab('requests'),
+            className: segBtn(tab === 'requests'),
+            style: segStyle(tab === 'requests'),
+          }, h(MousePointerClick, { size: 15 }), 'Edit Requests'),
+          h('button', {
+            onClick: () => setTab('resources'),
+            className: segBtn(tab === 'resources'),
+            style: segStyle(tab === 'resources'),
+          }, h(Pencil, { size: 14 }), 'Design Resource'),
+        ),
+      ),
+
+      status && h('div', { className: 'px-5 py-1 text-[11px] text-muted truncate' }, status),
+
+      // tab content
+      tab === 'resources'
+        ? h('div', { className: 'flex-1 flex items-center justify-center text-muted text-sm' }, 'Coming soon')
+        : h('div', { className: 'flex-1 min-h-0 flex flex-col' },
+            // requests list (scrolls independently)
+            h('div', { className: 'flex-1 min-h-0 overflow-y-auto px-5' },
+              pending.length === 0
+                ? h('div', { className: 'py-6 text-[13px] text-muted' },
+                    'No edit requests yet. Connect a web app, switch the preview to Edit mode, right-click an element, and describe the change.')
+                : pending.slice().reverse().map((it) =>
+                    h(RequestCard, { key: it.id, item: it, done: false, onSend: sendToAgent })),
+            ),
+
+            // History — pinned to the bottom, expands UPWARD when opened
+            h('div', { className: 'shrink-0 border-t border-border' },
+              histOpen && history.length > 0 && h('div', {
+                className: 'overflow-y-auto px-5 border-b border-border/60',
+                style: { maxHeight: '38vh' },
+              },
+                history.map((it) =>
+                  h(RequestCard, { key: it.id, item: it, done: true, onSend: () => {} })),
+              ),
+              h('button', {
+                onClick: () => setHistOpen(!histOpen),
+                className: 'w-full flex items-center gap-2 px-5 py-3 text-[15px] font-bold text-text cursor-pointer hover:bg-bg-elevated/40',
+              },
+                h(histOpen ? ChevronDown : ChevronRight, { size: 16, className: 'text-muted' }),
+                h(HistoryIcon, { size: 15, className: 'text-muted' }), 'History',
+                h('span', { className: 'text-[12px] text-muted font-normal' }, `(${history.length})`),
+              ),
+            ),
+          ),
     ),
 
-    h('div', { className: 'px-6 pb-8 overflow-y-auto flex-1 min-h-0' },
-      // Stats
-      h('div', { className: 'grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6' },
-        h(StatCard, { label: 'Pending requests', value: pending.length, accent: pending.length > 0 }),
-        h(StatCard, { label: 'Preview', value: loadedUrl ? 'Connected' : 'Idle' }),
-      ),
+    // drag handle = the gap between panels
+    h('div', {
+      onMouseDown: onDragStart,
+      title: 'Drag to resize',
+      className: 'shrink-0 cursor-col-resize',
+      style: { width: '11px' },
+    }),
 
-      // Preview card
-      h('div', { className: 'border border-border bg-card rounded-lg p-5 shadow-sm' },
-        h('h3', { className: 'text-sm font-semibold tracking-tight text-text-strong mb-3.5' }, 'Preview'),
-        h('div', { className: 'flex gap-2 mb-3' },
-          h('input', {
-            value: url,
-            onChange: (e) => setUrl(e.target.value),
-            placeholder: '/Users/you/Developer/my-app   (or http://localhost:5173)',
-            className: 'flex-1 px-3 py-2 rounded-md bg-bg-elevated border border-border text-sm text-text',
-          }),
-          loadedUrl
-            ? h('button', {
-                onClick: endPreview,
-                className: 'px-3 py-2 rounded-md border border-border text-text hover:border-border-strong text-sm font-semibold cursor-pointer',
-              }, 'End preview')
-            : h('button', {
-                onClick: () => startPreview(),
-                className: 'px-3 py-2 rounded-md bg-accent text-white text-sm font-semibold cursor-pointer',
-              }, 'View'),
-        ),
-        status && h('div', { className: 'text-[12px] text-muted mb-2' }, status),
-        h('div', {
-          className: 'rounded-lg overflow-hidden border border-border bg-bg-elevated',
-          style: { height: 520 },
-        },
-          loadedUrl
-            ? h('iframe', {
-                ref: iframeRef,
-                src: loadedUrl,
-                title: 'preview',
-                style: { width: '100%', height: '100%', border: 0 },
-                sandbox: 'allow-scripts allow-same-origin allow-forms',
-              })
-            : h('div', { className: 'h-full grid place-items-center text-sm text-muted px-8 text-center' },
-                'Enter your dev server URL and press Load. Add the selection script to your dev build (see README) to enable pointing.'),
-        ),
-      ),
+    // ================= RIGHT PANEL (bordered container: preview + action bar) =================
+    h('div', {
+      className: 'flex-1 min-w-0 flex flex-col min-h-0',
+      style: { border: '1px solid var(--border)', borderRadius: '16px', overflow: 'hidden' },
+    },
+      // upper: preview
+      previewId
+        ? h('div', { className: 'flex-1 min-h-0 flex items-center justify-center p-3' },
+            h('iframe', {
+              ref: iframeRef,
+              src: `${API_BASE}/proxy/${previewId}/?_t=${previewNonce}`,
+              onLoad: () => setEditMode(mode),
+              title: 'preview',
+              style: {
+                width: DIMS[dims], height: '100%', border: '1px solid var(--border, #4a464f)',
+                borderRadius: 8, background: '#fff', maxWidth: '100%',
+              },
+              sandbox: 'allow-scripts allow-same-origin allow-forms',
+            }),
+          )
+        : h('div', { className: 'flex-1 flex items-center justify-center text-muted text-sm px-10 text-center' },
+            'No web app selected. Pick one in the dropdown — switching is instant.'),
 
-      // Pending requests card
-      h('div', { className: 'border border-border bg-card rounded-lg p-5 shadow-sm mt-6' },
-        h('div', { className: 'flex items-center justify-between mb-1' },
-          h('h3', { className: 'text-sm font-semibold tracking-tight text-text-strong' }, 'Pending edit requests'),
+      // bottom: action bar (fixed, 44px — same as collapsed History header)
+      h('div', {
+        className: 'shrink-0 flex items-center justify-between px-3',
+        style: { height: '44px', borderTop: '1px solid var(--border)' },
+      },
+        // dimensions selector
+        h('div', { className: 'relative' },
           h('button', {
-            onClick: applyLatest,
-            disabled: pending.length === 0,
-            className: 'px-3 py-1.5 rounded-md bg-accent disabled:opacity-40 text-white text-xs font-semibold cursor-pointer inline-flex items-center gap-1.5',
-          }, h(Send, { size: 13 }), 'Send latest to agent'),
+            onClick: () => setDimsOpen(!dimsOpen),
+            className: 'flex items-center gap-2 h-8 px-3 rounded-xl text-[13px] text-text cursor-pointer hover:bg-bg-elevated',
+          },
+            h(Monitor, { size: 15 }),
+            h('span', { className: 'font-bold' }, 'Dimensions:'),
+            h('span', null, dims[0].toUpperCase() + dims.slice(1)),
+            h(ChevronDown, { size: 14, className: 'text-muted' }),
+          ),
+          dimsOpen && h('div', {
+            className: 'rounded-xl border border-border bg-card shadow-lg overflow-hidden',
+            style: { position: 'absolute', bottom: '40px', left: 0, minWidth: '180px', zIndex: 30 },
+          },
+            Object.keys(DIMS).map((k) => h('button', {
+              key: k,
+              onClick: () => { setDimsFor(previewId, k); setDimsOpen(false) },
+              className: `block w-full text-left px-4 h-9 text-[13px] cursor-pointer hover:bg-bg-elevated ${k === dims ? 'text-text font-bold' : 'text-muted'}`,
+            }, k[0].toUpperCase() + k.slice(1) + (k === 'desktop' ? '' : ` (${DIMS[k]})`))),
+          ),
         ),
-        pending.length === 0
-          ? h('div', { className: 'text-sm text-muted mt-2' },
-              'No requests yet. Toggle select mode in the preview (◎ button or Alt+S), right-click an element, and type a comment.')
-          : h('div', { className: 'space-y-2 mt-3' },
-              ...pending.map((p) =>
-                h('div', { key: p.id, className: 'text-sm border border-border rounded-md px-3 py-2 bg-bg-elevated' },
-                  h('div', { className: 'text-text font-medium' }, p.comment),
-                  h('div', { className: 'text-[12px] text-muted' },
-                    `${p.mode} · ${p.count} element${p.count === 1 ? '' : 's'} · ${p.previewUrl}`),
-                )
-              )
-            ),
+        // preview / edit toggle
+        h('div', { className: 'flex p-0.5 rounded-xl', style: { background: 'var(--panel)' } },
+          h('button', {
+            onClick: () => setEditMode('preview'),
+            className: segBtn(mode === 'preview') + ' px-3',
+            style: segStyle(mode === 'preview'),
+          }, h(Eye, { size: 14 }), 'Preview'),
+          h('button', {
+            onClick: () => setEditMode('edit'),
+            className: segBtn(mode === 'edit') + ' px-3',
+            style: segStyle(mode === 'edit'),
+          }, h(Pencil, { size: 14 }), 'Edit'),
+        ),
       ),
     ),
   )
 }
-
-export default SelectToEdit

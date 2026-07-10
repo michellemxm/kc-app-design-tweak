@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 import urllib.request
 import urllib.error
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PORT = int(os.environ.get("PORT", 9110))
 APP_NAME = os.environ.get("KIROCLAW_APP_NAME", "poke-and-prose")
 
@@ -73,6 +73,56 @@ HANDLED_DIR.mkdir(parents=True, exist_ok=True)
 MAX_BODY_BYTES = 2 * 1024 * 1024  # 2 MB cap on a single payload
 _ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")  # queue file id safety
 
+import threading
+_PICK_LOCK = threading.Lock()  # one native folder picker at a time
+
+# ---------------------------------------------------------------------------
+# Persistent config: registered projects, active project, request counter.
+# ---------------------------------------------------------------------------
+CONFIG_FILE = DATA_DIR / "config.json"
+APP_DIR = Path(__file__).resolve().parent.parent
+
+# The app's own git repo (for self-update + "open on GitHub").
+try:
+    REPO_URL = json.loads((APP_DIR / "app.json").read_text()).get("repository", "")
+except (OSError, ValueError):
+    REPO_URL = ""
+
+
+def _load_cfg() -> dict:
+    try:
+        cfg = json.loads(CONFIG_FILE.read_text("utf-8"))
+        if isinstance(cfg, dict):
+            cfg.setdefault("projects", [])
+            cfg.setdefault("activeId", "")
+            cfg.setdefault("counter", 0)
+            return cfg
+    except (OSError, ValueError):
+        pass
+    return {"projects": [], "activeId": "", "counter": 0}
+
+
+def _save_cfg(cfg: dict) -> None:
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    tmp.replace(CONFIG_FILE)
+
+
+_CFG = _load_cfg()
+
+
+def _active_project() -> dict | None:
+    for p in _CFG["projects"]:
+        if p["id"] == _CFG["activeId"]:
+            return p
+    return None
+
+
+def _next_number() -> int:
+    _CFG["counter"] = int(_CFG.get("counter", 0)) + 1
+    _save_cfg(_CFG)
+    return _CFG["counter"]
+
 
 def _new_id() -> str:
     return f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
@@ -89,13 +139,23 @@ def _pending_files() -> list[Path]:
 def _summarize(payload: dict) -> dict:
     sel = payload.get("selection") or {}
     elements = sel.get("elements") or []
+    el = elements[0] if elements else {}
+    el_name = el.get("tag", "")
+    if el.get("id"):
+        el_name += f"#{el['id']}"
+    elif el.get("classes"):
+        el_name += "." + ".".join(el["classes"][:2])
     return {
         "id": payload.get("id", ""),
+        "number": payload.get("number", 0),
+        "status": payload.get("status", "new"),
         "createdAt": payload.get("createdAt", ""),
         "comment": payload.get("comment", ""),
         "mode": sel.get("mode", "single"),
         "count": len(elements),
+        "element": el_name,
         "previewUrl": payload.get("previewUrl", ""),
+        "projectRoot": payload.get("projectRoot", ""),
     }
 
 
@@ -124,8 +184,15 @@ def _valid_root(path: str):
     return p
 
 
-_CTYPE_OVERRIDES = {
-    ".mjs": "text/javascript",
+# Boot-time restore: resume serving the active project across restarts.
+_boot_active = _active_project()
+if _boot_active:
+    _boot_root = _valid_root(_boot_active.get("path", ""))
+    if _boot_root is not None:
+        _ROOT = str(_boot_root)
+
+
+_CTYPE_OVERRIDES = {    ".mjs": "text/javascript",
     ".js": "text/javascript",
     ".css": "text/css",
     ".svg": "image/svg+xml",
@@ -144,14 +211,14 @@ def _guess_ctype(p: Path) -> str:
     return mime or "application/octet-stream"
 
 
-def _rewrite_html(body: bytes) -> bytes:
+def _rewrite_html(body: bytes, base: str = PROXY_PUBLIC_BASE) -> bytes:
     """Inject <base> (so relative assets resolve back through the proxy) and the
     Select-to-Edit overlay script (so no manual wiring is needed)."""
     try:
         html = body.decode("utf-8", "replace")
     except (UnicodeDecodeError, AttributeError):
         return body
-    base_tag = f'<base href="{PROXY_PUBLIC_BASE}">'
+    base_tag = f'<base href="{base}">'
     inject_tag = f'<script src="{INJECT_PUBLIC}"></script>'
     low = html.lower()
     head = low.find("<head")
@@ -212,6 +279,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, json.loads(files[-1].read_text("utf-8")))
                 except (OSError, ValueError) as exc:
                     return self._json(500, {"error": str(exc)})
+            if route == "/projects":
+                return self._h_projects_list()
+            if route == "/history":
+                pending = []
+                for fp in sorted(HANDLED_DIR.glob("*.json"), reverse=True)[:50]:
+                    try:
+                        pending.append(_summarize(json.loads(fp.read_text("utf-8"))))
+                    except (OSError, ValueError):
+                        continue
+                return self._json(200, {"history": pending})
             if route == "/proxy-inject.js":
                 return self._h_inject()
             if route == "/proxy" or route.startswith("/proxy/"):
@@ -230,6 +307,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._h_clear(qs)
             if route in ("/source", "/target"):
                 return self._h_set_source()
+            if route == "/projects":
+                return self._h_projects_add()
+            if route == "/projects/select":
+                return self._h_projects_select()
+            if route == "/projects/remove":
+                return self._h_projects_remove()
+            if route == "/pick-folder":
+                return self._h_pick_folder()
+            if route == "/mark-sent":
+                return self._h_mark_sent(qs)
+            if route == "/self-update":
+                return self._h_self_update()
             return self._json(404, {"error": f"POST {route} not found"})
         except Exception as exc:  # noqa: BLE001
             return self._json(500, {"error": str(exc)})
@@ -260,14 +349,22 @@ class Handler(BaseHTTPRequestHandler):
             rid = _new_id()
         payload["id"] = rid
         payload.setdefault("createdAt", _now_iso())
+        payload["number"] = _next_number()
+        payload.setdefault("status", "new")
 
         # Stamp project context so the agent doesn't have to search for the source.
-        if _ROOT:
+        pu = str(payload.get("previewUrl", ""))
+        marker = "/api/proxy/"
+        i = pu.find(marker)
+        rel = pu[i + len(marker):].split("?")[0].split("#")[0] if i != -1 else ""
+        seg = rel.split("/", 1)[0] if rel else ""
+        proj = next((p for p in _CFG["projects"] if p["id"] == seg), None)
+        if proj is not None:
+            rest = rel.split("/", 1)[1] if "/" in rel else ""
+            payload["projectRoot"] = proj["path"]
+            payload["sourceFile"] = str(Path(proj["path"]) / (rest or "index.html"))
+        elif _ROOT:
             payload["projectRoot"] = _ROOT
-            pu = str(payload.get("previewUrl", ""))
-            marker = "/api/proxy/"
-            i = pu.find(marker)
-            rel = pu[i + len(marker):].split("?")[0].split("#")[0] if i != -1 else ""
             payload["sourceFile"] = str(Path(_ROOT) / (rel or "index.html"))
         elif _TARGET:
             payload["projectRoot"] = ""
@@ -290,6 +387,159 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             return self._json(500, {"error": str(exc)})
         return self._json(200, {"ok": True, "id": rid})
+
+    # ---- project registry handlers ----
+    def _h_projects_list(self) -> None:
+        active = _active_project()
+        serving = bool(_ROOT and active and str(Path(active["path"]).resolve()) == _ROOT)
+        return self._json(200, {
+            "projects": _CFG["projects"],
+            "activeId": _CFG["activeId"],
+            "serving": serving,
+            "repoUrl": REPO_URL,
+            "version": VERSION,
+        })
+
+    def _h_projects_add(self) -> None:
+        data = self._read_body()
+        raw = str(data.get("path", "")).strip()
+        root = _valid_root(raw)
+        if root is None:
+            return self._json(400, {"error": f"not a readable folder: {raw}"})
+        for p in _CFG["projects"]:
+            if str(Path(p["path"]).resolve()) == str(root):
+                return self._json(200, {"ok": True, "project": p, "existing": True})
+        proj = {"id": uuid.uuid4().hex[:8], "path": str(root), "name": root.name}
+        _CFG["projects"].append(proj)
+        _save_cfg(_CFG)
+        return self._json(200, {"ok": True, "project": proj})
+
+    def _h_projects_select(self) -> None:
+        """Connect a registered project: make it the active served root."""
+        data = self._read_body()
+        pid = str(data.get("id", ""))
+        proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+        if proj is None:
+            return self._json(404, {"error": "project not found"})
+        root = _valid_root(proj["path"])
+        if root is None:
+            return self._json(400, {"error": f"folder no longer readable: {proj['path']}"})
+        global _ROOT, _TARGET
+        _ROOT = str(root)
+        _TARGET = ""
+        _CFG["activeId"] = pid
+        _save_cfg(_CFG)
+        return self._json(200, {"ok": True, "project": proj, "proxyUrl": PROXY_PUBLIC_BASE})
+
+    def _h_projects_remove(self) -> None:
+        """Remove a project from the registry (does not touch the folder on disk)."""
+        data = self._read_body()
+        pid = str(data.get("id", ""))
+        proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+        if proj is None:
+            return self._json(404, {"error": "project not found"})
+        _CFG["projects"] = [p for p in _CFG["projects"] if p["id"] != pid]
+        global _ROOT
+        if _CFG.get("activeId") == pid:
+            _CFG["activeId"] = ""
+            _ROOT = ""
+        _save_cfg(_CFG)
+        return self._json(200, {"ok": True, "id": pid})
+
+    def _h_pick_folder(self) -> None:
+        """Open the native macOS folder chooser (osascript) and return the
+        picked absolute path. The backend runs on the user's Mac, so the
+        dialog appears locally — the browser never needs the path."""
+        import subprocess
+        import sys as _sys
+        if _sys.platform != "darwin":
+            return self._json(501, {"error": "native picker is macOS-only"})
+        if not _PICK_LOCK.acquire(blocking=False):
+            return self._json(409, {"error": "a folder picker is already open"})
+        try:
+            script = (
+                'tell application "System Events" to activate\n'
+                'POSIX path of (choose folder with prompt "Select a web app folder for Poke & Prose")'
+            )
+            r = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            return self._json(408, {"error": "picker timed out"})
+        except OSError as exc:
+            return self._json(500, {"error": str(exc)})
+        finally:
+            _PICK_LOCK.release()
+        if r.returncode != 0:
+            err = (r.stderr or "").strip()
+            if "-128" in err or "canceled" in err.lower():
+                return self._json(200, {"ok": False, "canceled": True})
+            return self._json(500, {"error": err[-200:] or "picker failed"})
+        path = r.stdout.strip().rstrip("/")
+        if not path:
+            return self._json(200, {"ok": False, "canceled": True})
+        return self._json(200, {"ok": True, "path": path})
+
+    def _h_mark_sent(self, qs: dict) -> None:
+        rid = (qs.get("id") or [""])[0]
+        if not rid or not _ID_RE.match(rid):
+            return self._json(400, {"error": "valid id required"})
+        fp = QUEUE_DIR / f"{rid}.json"
+        if not fp.exists():
+            return self._json(404, {"error": "not found"})
+        try:
+            payload = json.loads(fp.read_text("utf-8"))
+            payload["status"] = "sent"
+            fp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            return self._json(500, {"error": str(exc)})
+        return self._json(200, {"ok": True, "id": rid, "status": "sent"})
+
+    def _h_self_update(self) -> None:
+        """Pull the latest app code from its declared git repo into the installed
+        app dir. UI changes apply on refresh; backend changes need a gateway restart."""
+        import shutil
+        import subprocess
+        import tempfile
+        if not REPO_URL:
+            return self._json(400, {"error": "no 'repository' declared in app.json"})
+        with tempfile.TemporaryDirectory() as td:
+            clone_dir = str(Path(td) / "app")
+            try:
+                r = subprocess.run(
+                    ["git", "clone", "--depth", "1", REPO_URL, clone_dir],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return self._json(502, {"error": f"git clone failed: {exc}"})
+            if r.returncode != 0:
+                return self._json(502, {"error": "git clone failed: " + r.stderr[-300:]})
+            src = Path(clone_dir)
+            try:
+                new_version = json.loads((src / "app.json").read_text()).get("version", "?")
+            except (OSError, ValueError):
+                return self._json(502, {"error": "cloned repo has no valid app.json"})
+            copied = []
+            for item in ("app.json", "README.md", "backend", "ui", "skills", "inject", "plugins"):
+                s = src / item
+                if not s.exists():
+                    continue
+                dst = APP_DIR / item
+                try:
+                    if s.is_dir():
+                        shutil.copytree(s, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, dst)
+                    copied.append(item)
+                except OSError as exc:
+                    return self._json(500, {"error": f"copy failed for {item}: {exc}"})
+        return self._json(200, {
+            "ok": True,
+            "version": new_version,
+            "copied": copied,
+            "note": "UI updates on refresh; backend changes require a gateway restart.",
+        })
 
     # ---- source + proxy handlers ----
     def _h_set_source(self) -> None:
@@ -329,20 +579,36 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_raw(200, "application/javascript; charset=utf-8", js)
 
     def _h_proxy(self, sub: str) -> None:
+        # Multi-project: /proxy/<projectId>/... serves ANY registered project —
+        # all projects are simultaneously live; switching is just a URL change.
+        rel = sub.lstrip("/")
+        first = rel.split("/", 1)[0] if rel else ""
+        proj = next((p for p in _CFG["projects"] if p["id"] == first), None)
+        if proj is not None:
+            root = _valid_root(proj["path"])
+            if root is None:
+                return self._send_raw(
+                    404, "text/html; charset=utf-8",
+                    b"<h3 style='font:14px system-ui;padding:24px'>Project folder no longer readable.</h3>",
+                )
+            rest = rel.split("/", 1)[1] if "/" in rel else ""
+            return self._h_serve_root(
+                "/" + rest, str(root), PROXY_PUBLIC_BASE + proj["id"] + "/"
+            )
+        # Legacy single-root + dev-server URL modes.
         if _ROOT:
-            return self._h_serve_root(sub)
+            return self._h_serve_root(sub, _ROOT, PROXY_PUBLIC_BASE)
         if _TARGET:
             return self._h_proxy_upstream(sub)
         return self._send_raw(
             503, "text/html; charset=utf-8",
             b"<h3 style='font:14px system-ui;padding:24px'>No project selected. "
-            b"Enter a folder path (or a localhost dev-server URL) and click "
-            b"<b>View</b> in the Select to Edit panel.</h3>",
+            b"Pick a web app in the Poke & Prose panel.</h3>",
         )
 
-    def _h_serve_root(self, sub: str) -> None:
-        """Serve a file from the configured project folder (static hosting)."""
-        root = Path(_ROOT)
+    def _h_serve_root(self, sub: str, root_str: str, base: str) -> None:
+        """Serve a file from a project folder (static hosting)."""
+        root = Path(root_str)
         rel = sub.lstrip("/")
         target = (root / rel).resolve() if rel else root
         try:
@@ -362,7 +628,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_raw(500, "text/plain", str(exc).encode())
         ctype = _guess_ctype(target)
         if "text/html" in ctype:
-            data = _rewrite_html(data)
+            data = _rewrite_html(data, base)
             ctype = "text/html; charset=utf-8"
         return self._send_raw(200, ctype, data)
 

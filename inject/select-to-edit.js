@@ -50,10 +50,15 @@
 
   var input = null; // floating comment input container
 
+  // Embedded in the Poke & Prose preview iframe? Then the panel's Preview/Edit
+  // switcher controls select mode (via postMessage) — hide our own toggle.
+  var EMBEDDED = false;
+  try { EMBEDDED = window.parent && window.parent !== window; } catch (_) { EMBEDDED = true; }
+
   function mount() {
     document.body.appendChild(hoverBox);
     document.body.appendChild(selBox);
-    document.body.appendChild(toggleBtn);
+    if (!EMBEDDED) document.body.appendChild(toggleBtn);
   }
   if (document.body) mount();
   else document.addEventListener("DOMContentLoaded", mount);
@@ -74,6 +79,28 @@
     } else if (e.key === "Escape") {
       if (state.selected) clearSelection();
       else if (state.active) setActive(false);
+    }
+  });
+
+  // Parent page (Poke & Prose panel) can toggle select mode and pass the host
+  // theme via postMessage (the previewed page has no KiroClaw CSS variables).
+  var THEME = { accent: "#8b5cf6", panel: "#141220", text: "#e9e7ff", border: "#2a2740", info: "#3b82f6" };
+  function applyTheme(t) {
+    if (!t) return;
+    for (var k in THEME) if (t[k]) THEME[k] = t[k];
+    hoverBox.style.borderColor = THEME.info;
+    selBox.style.borderColor = THEME.accent;
+    if (input) {
+      input.style.background = THEME.panel;
+      input.style.borderColor = THEME.accent;
+      input.style.color = THEME.text;
+    }
+  }
+  window.addEventListener("message", function (e) {
+    var d = e && e.data;
+    if (d && d.source === "kiro-ste-host") {
+      applyTheme(d.theme);
+      if (typeof d.editMode === "boolean") setActive(d.editMode);
     }
   });
 
@@ -147,9 +174,9 @@
     input = document.createElement("div");
     css(input, {
       position: "fixed", zIndex: 2147483647, width: "300px",
-      background: "#141220", border: "1px solid #8b5cf6", borderRadius: "10px",
+      background: THEME.panel, border: "1px solid " + THEME.accent, borderRadius: "10px",
       padding: "10px", boxShadow: "0 8px 30px rgba(0,0,0,.5)",
-      font: "13px system-ui, sans-serif", color: "#e9e7ff",
+      font: "13px system-ui, sans-serif", color: THEME.text,
     });
 
     var summary = document.createElement("div");
@@ -167,7 +194,7 @@
     var row = document.createElement("div");
     css(row, { display: "flex", gap: "6px", justifyContent: "flex-end", marginTop: "8px" });
     var cancel = mkBtn("Cancel", "#2a2740", function () { clearSelection(); });
-    var send = mkBtn("Send →", "#8b5cf6", function () { submit(el, ta.value); });
+    var send = mkBtn("Send →", THEME.accent, function () { submit(el, ta.value); });
     row.appendChild(cancel);
     row.appendChild(send);
 
