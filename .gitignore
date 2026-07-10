@@ -1,0 +1,10 @@
+# runtime state (created by KiroClaw at install/enable time — never publish)
+data/
+.app_secret
+installed.json
+
+# junk
+.DS_Store
+__pycache__/
+node_modules/
+*.log

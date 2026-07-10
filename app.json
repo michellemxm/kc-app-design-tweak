@@ -1,0 +1,52 @@
+{
+  "name": "poke-and-prose",
+  "version": "0.3.0",
+  "displayName": "Poke & Prose",
+  "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent — like Figma comments, but for code.",
+  "author": "mxiaomen",
+  "license": "MIT",
+  "tags": [
+    "design",
+    "frontend",
+    "preview",
+    "visual-editing",
+    "productivity"
+  ],
+  "defaultEnabled": false,
+  "minKiroClawVersion": "0.1.0",
+  "skills": [
+    "skills/visual-edit"
+  ],
+  "permissions": {
+    "api": [
+      "/apps/poke-and-prose/api"
+    ],
+    "events": [
+      "visual-edit:request"
+    ],
+    "storage": true,
+    "network": true,
+    "cron": true
+  },
+  "ui": {
+    "entry": "index.mjs",
+    "pages": [
+      {
+        "route": "/poke-and-prose",
+        "label": "Poke & Prose",
+        "icon": "MousePointerClick"
+      }
+    ]
+  },
+  "backend": {
+    "entryPoint": "backend/server.py",
+    "port": "auto",
+    "healthCheck": "/health"
+  },
+  "platform": {
+    "os": [
+      "macos",
+      "linux"
+    ]
+  }
+}
