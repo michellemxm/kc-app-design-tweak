@@ -5,7 +5,7 @@
 **Point, describe, and watch the code catch up.**
 
 Visually select elements in a live preview of your web app and turn them into
-scoped, source-mapped edit requests for the KiroClaw agent — like Figma
+scoped, source-mapped edit requests for your coding agent — like Figma
 comments, for code.
 
 For **designers and front-end engineers** iterating on UI: switch the preview to
@@ -36,17 +36,17 @@ second from the right".
   (Desktop / Tablet 768px / Mobile 390px) and the **Preview | Edit** mode switcher.
 - **Layout** — resizable two-panel layout (drag the gap; 360–800px left rail,
   persisted), each panel in a bordered 16px-radius container.
-- **Fully themed** — every color derives from KiroClaw's theme tokens
+- **Fully themed** — every color derives from the host's theme tokens
   (`--accent`, `--accent-fg`, `--panel`, `--border`, …), including the selection
-  overlay inside the preview. Switch KiroClaw themes and Poke & Prose follows.
+  overlay inside the preview. Switch the host theme and Poke & Prose follows.
 - **Self-update** — the sync button in the header pulls the latest version of
   this app from GitHub; the GitHub button opens this repo.
 
 ## Install & enable
 
-The UI is a hand-written federated ES module (like KiroClaw's shipping
-`demo-app`) — it resolves React, `@kiroclaw/app-sdk`, and `lucide-react` from the
-host import map at runtime, so **there is no npm build step**.
+The UI is a hand-written federated ES module — it resolves React,
+`@kiroclaw/app-sdk`, and `lucide-react` from the host import map at runtime, so
+**there is no npm build step**.
 
 **From GitHub (recommended for sharing):**
 
@@ -56,14 +56,14 @@ kiroclaw app install ./poke-and-prose
 kiroclaw app enable poke-and-prose
 ```
 
-Then restart the KiroClaw gateway (quit + reopen the app) so the backend spawns.
+Then restart the host gateway (quit + reopen the app) so the backend spawns.
 
-**Or via the App Store (registry):** add this repo to your KiroClaw config under
+**Or via the App Store (registry):** add this repo to your host config under
 `registries` — `{ "name": "poke-and-prose", "repo": "https://github.com/michellemxm/poke-and-prose.git", "branch": "main" }` —
 and install from the Apps page.
 
-> ⚠️ **Trust note:** enabling any KiroClaw app runs its code in-process with full
-> gateway privileges (see KiroClaw's App Platform Trust Model). Review `app.json`
+> ⚠️ **Trust note:** enabling any app runs its code in-process with full
+> gateway privileges (see the host's App Platform Trust Model). Review `app.json`
 > and `backend/server.py` before enabling. Only enable apps you trust.
 
 ## Use it
@@ -87,7 +87,7 @@ source-mapping plugin for exact `file:line:col` targeting (see below).
 
 | Concern                | Implementation                                                        |
 |------------------------|-----------------------------------------------------------------------|
-| Preview                | Backend serves each registered folder same-origin at `/proxy/<id>/` (dashboard CSP is `frame-src 'self'`, so same-origin serving is required) |
+| Preview                | Backend serves each registered folder same-origin at `/proxy/<id>/` (the dashboard CSP is `frame-src 'self'`, so same-origin serving is required) |
 | Selection overlay      | `inject/select-to-edit.js`, auto-injected into served HTML — no manual wiring |
 | Panel ↔ overlay bridge | `window.postMessage` both ways (selections up; mode + theme colors down) |
 | Source mapping         | `projectRoot` + `sourceFile` stamped per request from the serving path; optional `plugins/vite-plugin-kiro-source.js` adds `data-kiro-source="file:line:col"` for framework projects |
