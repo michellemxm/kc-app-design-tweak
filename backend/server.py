@@ -13,6 +13,7 @@ Endpoints (as seen after proxy prefix strip):
   GET  /queue               → {"pending":[{id,createdAt,comment,mode,count,previewUrl}]}
   GET  /latest              → newest pending request (full payload) or {}
   POST /clear?id=<id>       → move request to handled/ → {"ok","id"}
+  POST /thread?id=<id>      → append {role,text,status?} to a request thread
 
 Delivery model: this process cannot call the agent directly (separate process).
 Instead it writes the structured payload to the app data queue dir; the bundled
@@ -34,7 +35,7 @@ from urllib.parse import parse_qs, urlparse
 import urllib.request
 import urllib.error
 
-VERSION = "0.4.0"
+VERSION = "0.6.0"
 PORT = int(os.environ.get("PORT", 9110))
 APP_NAME = os.environ.get("KIROCLAW_APP_NAME", "poke-and-prose")
 
@@ -154,6 +155,8 @@ def _summarize(payload: dict) -> dict:
         "mode": sel.get("mode", "single"),
         "count": len(elements),
         "element": el_name,
+        "locator": el.get("locator", ""),
+        "thread": payload.get("thread", []),
         "previewUrl": payload.get("previewUrl", ""),
         "projectRoot": payload.get("projectRoot", ""),
     }
@@ -305,6 +308,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._h_submit()
             if route == "/clear":
                 return self._h_clear(qs)
+            if route == "/delete":
+                return self._h_delete(qs)
             if route in ("/source", "/target"):
                 return self._h_set_source()
             if route == "/projects":
@@ -317,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._h_pick_folder()
             if route == "/mark-sent":
                 return self._h_mark_sent(qs)
+            if route == "/thread":
+                return self._h_thread(qs)
             if route == "/self-update":
                 return self._h_self_update()
             return self._json(404, {"error": f"POST {route} not found"})
@@ -352,6 +359,16 @@ class Handler(BaseHTTPRequestHandler):
         payload["number"] = _next_number()
         payload.setdefault("status", "new")
 
+        # Seed the per-request thread with the user's comment as the first entry.
+        # The agent appends progress/results via POST /thread; the in-page overlay
+        # polls and renders this as a Figma-style comment thread on the element.
+        if not isinstance(payload.get("thread"), list) or not payload["thread"]:
+            payload["thread"] = [{
+                "role": "user",
+                "text": payload.get("comment", ""),
+                "ts": payload["createdAt"],
+            }]
+
         # Stamp project context so the agent doesn't have to search for the source.
         pu = str(payload.get("previewUrl", ""))
         marker = "/api/proxy/"
@@ -372,7 +389,9 @@ class Handler(BaseHTTPRequestHandler):
 
         out = QUEUE_DIR / f"{rid}.json"
         out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        return self._json(200, {"ok": True, "id": rid, "savedTo": str(out)})
+        return self._json(200, {
+            "ok": True, "id": rid, "number": payload["number"], "savedTo": str(out),
+        })
 
     def _h_clear(self, qs: dict) -> None:
         rid = (qs.get("id") or [""])[0]
@@ -387,6 +406,25 @@ class Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             return self._json(500, {"error": str(exc)})
         return self._json(200, {"ok": True, "id": rid})
+
+    def _h_delete(self, qs: dict) -> None:
+        """Permanently delete a request (from queue/ or handled/). Unlike /clear
+        (which archives to handled/), this removes the file entirely."""
+        rid = (qs.get("id") or [""])[0]
+        if not rid or not _ID_RE.match(rid):
+            return self._json(400, {"error": "valid id required"})
+        removed = False
+        for d in (QUEUE_DIR, HANDLED_DIR):
+            fp = d / f"{rid}.json"
+            if fp.exists():
+                try:
+                    fp.unlink()
+                    removed = True
+                except OSError as exc:
+                    return self._json(500, {"error": str(exc)})
+        if not removed:
+            return self._json(404, {"error": "not found"})
+        return self._json(200, {"ok": True, "id": rid, "deleted": True})
 
     # ---- project registry handlers ----
     def _h_projects_list(self) -> None:
@@ -495,6 +533,48 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as exc:
             return self._json(500, {"error": str(exc)})
         return self._json(200, {"ok": True, "id": rid, "status": "sent"})
+
+    def _h_thread(self, qs: dict) -> None:
+        """Append a message to a request's thread and optionally update its status.
+
+        Body: {"role": "agent"|"user"|"system", "text": "...", "status": "done"?}
+        The agent calls this while working a request so the in-page overlay shows
+        progress like a Figma comment thread. Looks in queue/ first, then handled/.
+        """
+        rid = (qs.get("id") or [""])[0]
+        if not rid or not _ID_RE.match(rid):
+            return self._json(400, {"error": "valid id required"})
+        data = self._read_body()
+        text = str(data.get("text", "")).strip()
+        role = str(data.get("role", "agent")).strip() or "agent"
+        if role not in ("agent", "user", "system"):
+            role = "agent"
+        new_status = str(data.get("status", "")).strip()
+        if not text and not new_status:
+            return self._json(400, {"error": "text or status required"})
+
+        fp = QUEUE_DIR / f"{rid}.json"
+        if not fp.exists():
+            fp = HANDLED_DIR / f"{rid}.json"
+        if not fp.exists():
+            return self._json(404, {"error": "not found"})
+        try:
+            payload = json.loads(fp.read_text("utf-8"))
+            thread = payload.get("thread")
+            if not isinstance(thread, list):
+                thread = []
+            if text:
+                thread.append({"role": role, "text": text, "ts": _now_iso()})
+            payload["thread"] = thread
+            if new_status in ("new", "sent", "done"):
+                payload["status"] = new_status
+            fp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            return self._json(500, {"error": str(exc)})
+        return self._json(200, {
+            "ok": True, "id": rid, "status": payload.get("status"),
+            "count": len(payload["thread"]),
+        })
 
     def _h_self_update(self) -> None:
         """Pull the latest app code from its declared git repo into the installed
