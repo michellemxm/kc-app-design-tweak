@@ -1,6 +1,6 @@
 {
   "name": "poke-and-prose",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "repository": "https://github.com/michellemxm/poke-and-prose",
   "displayName": "Poke & Prose",
   "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent — like Figma comments, but for code.",

@@ -37,9 +37,27 @@ request", or references a selection they just made, do this:
    refactor surrounding code. For `mode: "multi"`, apply the comment to every element
    in `elements` (they were selected as a set — e.g. "increase spacing between these
    cards" applies to the shared container/gap).
-5. **Mark the request handled**: after a successful edit, move or delete the queue
-   file (or `POST /apps/poke-and-prose/api/clear?id=<id>`) so it is not
-   re-applied. Then tell the user what you changed and in which file.
+5. **Stream progress back to the in-preview pin.** As you work, POST short notes to
+   the request thread so they appear in the Figma-style comment popover anchored to
+   the element:
+
+   ```
+   POST /apps/poke-and-prose/api/thread?id=<id>
+   body: {"role": "agent", "text": "Editing styles.css — uppercasing .section-title"}
+   ```
+
+   Keep each note to one short line. Post one when you start, and one per meaningful
+   step. When finished, post a final note **with a status** so the pin turns green:
+
+   ```
+   POST /apps/poke-and-prose/api/thread?id=<id>
+   body: {"role": "agent", "text": "Done — added text-transform: uppercase", "status": "done"}
+   ```
+
+   Setting `"status": "done"` marks the request complete (pin turns green) while
+   keeping the thread visible. Do NOT clear the request unless the user asks to
+   dismiss it — clearing removes the pin. (Use `POST /clear?id=<id>` only to dismiss.)
+6. Tell the user what you changed and in which file.
 
 ## Payload schema
 
@@ -55,6 +73,7 @@ request", or references a selection they just made, do this:
         "tag": "div",
         "id": "",
         "classes": ["card", "card--pricing"],
+        "locator": "main > section:nth-of-type(2) > div:nth-of-type(3)",
         "boundingRect": { "x": 120, "y": 340, "width": 280, "height": 180 },
         "source": {
           "file": "src/components/PricingCard.tsx",
@@ -68,7 +87,10 @@ request", or references a selection they just made, do this:
     ]
   },
   "comment": "increase spacing between these cards",
-  "previewUrl": "http://localhost:5173/pricing"
+  "previewUrl": "http://localhost:5173/pricing",
+  "thread": [
+    { "role": "user", "text": "increase spacing between these cards", "ts": "2026-07-13T18:00:00Z" }
+  ]
 }
 ```
 

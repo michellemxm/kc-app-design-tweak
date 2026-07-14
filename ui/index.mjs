@@ -3,7 +3,7 @@
 // Two-panel layout inside KiroClaw's content area: 450px left rail + preview.
 
 const React = window.__kiroclaw_modules.react
-const { useAppApi, useChatLauncher } = window.__kiroclaw_modules['@kiroclaw/app-sdk']
+const { useAppApi, useChatLauncher, useNavigate } = window.__kiroclaw_modules['@kiroclaw/app-sdk']
 const {
   MousePointerClick, RefreshCw, ChevronDown, ChevronRight,
   Send, Folder, Plus, Monitor, Eye, Pencil, History: HistoryIcon, X,
@@ -21,8 +21,53 @@ function GithubIcon({ size = 16 }) {
   }))
 }
 
+// Inline SVGs for the per-request hover actions (avoids depending on lucide
+// icons that may be absent from the host's bundled set).
+function ChatOpenIcon({ size = 14 }) {
+  return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    h('path', { d: 'M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.8-.9L3 21l1.9-5.7A8.5 8.5 0 1 1 21 11.5z' }))
+}
+function ArchiveIcon({ size = 14 }) {
+  return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    h('rect', { x: 3, y: 4, width: 18, height: 4, rx: 1 }),
+    h('path', { d: 'M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8' }),
+    h('path', { d: 'M10 12h4' }))
+}
+function TrashIcon({ size = 14 }) {
+  return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    h('path', { d: 'M3 6h18' }),
+    h('path', { d: 'M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2' }),
+    h('path', { d: 'M6 6l1 14a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-14' }))
+}
+
 const API_BASE = '/apps/poke-and-prose/api'
 const DIMS = { desktop: '100%', tablet: '768px', mobile: '390px' }
+
+// --- Per-app chat session (mirrors the host's useChatSession slotting) ---------
+// Each web app (by its folder path) maps to ONE deterministic chat slot, so all
+// its edit requests land as turns in the SAME session (persists across visits).
+// slotKey = "poke-and-prose-" + djb2(path) — identical to the host's hash so the
+// slot lines up with what /chat?sid=<key> opens.
+const APP_SLOT_PREFIX = 'poke-and-prose'
+function djb2Base36(str) {
+  let t = 0
+  for (let i = 0; i < (str || '').length; i++) t = ((t << 5) - t + str.charCodeAt(i)) | 0
+  return (t >>> 0).toString(36)
+}
+function slotKeyFor(path) { return `${APP_SLOT_PREFIX}-${djb2Base36(path || '')}` }
+
+// Plain same-origin calls to the host chat API — exactly how the dashboard itself
+// calls them (no auth header needed; the panel runs in the dashboard origin).
+async function chatApi(url, method, body) {
+  const r = await fetch(url, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!r.ok) throw new Error(`chat API ${r.status}`)
+  const t = await r.text()
+  return t ? JSON.parse(t) : null
+}
 
 function timeAgo(iso) {
   if (!iso) return ''
@@ -47,8 +92,29 @@ function Chip({ status }) {
   }, c.label)
 }
 
-function RequestCard({ item, done, onSend }) {
-  return h('div', { className: 'py-2 border-b border-border/60' },
+function RequestCard({ item, done, onFocus, hovered, onHover, onOpenChat, onArchive, onDelete }) {
+  const thread = Array.isArray(item.thread) ? item.thread : []
+  const lastAgent = thread.slice().reverse().find((m) => m && m.role !== 'user')
+
+  // History cards (done) keep the original full-bleed look; only the sessions
+  // list gets the inset themed border + hover actions.
+  const containerClass = done
+    ? 'py-2 border-b border-border/60'
+    : 'py-2 border-b border-border cursor-pointer'
+
+  const iconBtn = (title, icon, handler) => h('button', {
+    title,
+    onClick: (e) => { e.stopPropagation(); handler(item) },
+    className: 'p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+  }, icon)
+
+  return h('div', {
+    className: containerClass,
+    onClick: done ? undefined : () => onFocus && onFocus(item),
+    onMouseEnter: done ? undefined : () => onHover && onHover(item.id),
+    onMouseLeave: done ? undefined : () => onHover && onHover(''),
+    title: done ? undefined : 'Click to open/close this pin in the preview',
+  },
     h('div', { className: 'flex items-center gap-1 text-[11px] text-muted' },
       h('span', null, `#${item.number || '—'}`),
       h('span', null, '·'),
@@ -60,15 +126,23 @@ function RequestCard({ item, done, onSend }) {
       className: 'text-[13px] text-text mt-0.5',
       style: { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
     }, item.comment),
+    lastAgent && h('div', {
+      className: 'text-[12px] text-muted mt-1 pl-2',
+      style: {
+        borderLeft: '2px solid var(--border)',
+        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+      },
+    }, lastAgent.text),
     h('div', { className: 'flex items-center gap-2 mt-1.5' },
       h('span', { className: 'text-[12px] text-muted' }, `Updated ${timeAgo(item.createdAt)}`),
       h(Chip, { status: done ? 'done' : item.status }),
       h('span', { className: 'flex-1' }),
-      !done && h('button', {
-        title: 'Send to agent',
-        onClick: () => onSend(item),
-        className: 'p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
-      }, h(Send, { size: 14 })),
+      // Hover-only actions (sessions list only)
+      !done && hovered && h('div', { className: 'flex items-center gap-0.5' },
+        iconBtn('Open in chat', h(ChatOpenIcon, { size: 14 }), onOpenChat),
+        iconBtn('Archive to History', h(ArchiveIcon, { size: 14 }), onArchive),
+        iconBtn('Delete request', h(TrashIcon, { size: 14 }), onDelete),
+      ),
     ),
   )
 }
@@ -76,6 +150,7 @@ function RequestCard({ item, done, onSend }) {
 export default function PokeAndProse() {
   const api = useAppApi()
   const { openChat } = useChatLauncher()
+  const navigate = useNavigate()
 
   const [projects, setProjects] = useState([])
   const [activeId, setActiveId] = useState('')     // backend: which project is served
@@ -108,6 +183,46 @@ export default function PokeAndProse() {
   const [mode, setMode] = useState('preview')
   const [status, setStatus] = useState('')
   const iframeRef = useRef(null)
+  const pendingRef = useRef([])
+  useEffect(() => { pendingRef.current = pending }, [pending])
+  // Tracks each request's last-seen status so we can auto-reload the preview
+  // exactly once when a request for the current app transitions to "done".
+  const seenStatusRef = useRef(null)
+
+  // Which per-app chat slots we've already ensured exist (this panel session).
+  const ensuredSlots = useRef(new Set())
+  const ensureSlot = useCallback(async (path, label) => {
+    const key = slotKeyFor(path)
+    if (ensuredSlots.current.has(key)) return key
+    let slots = []
+    try { slots = await chatApi('/api/chat/slots', 'GET') } catch { /* ignore */ }
+    const exists = Array.isArray(slots) && slots.some((s) => s.key === key)
+    if (!exists) {
+      await chatApi('/api/chat/slots', 'POST', { name: key, agent: '' })
+      const seed =
+        `Poke & Prose session for "${label}". Working directory: ${path}\n` +
+        `You handle visual edit requests for this web app. For each request, edit the ` +
+        `exact source file, then post a one-line summary. Keep responses concise.`
+      try { await chatApi('/api/chat', 'POST', { message: seed, slot: key, agent: '' }) } catch { /* ignore */ }
+    }
+    ensuredSlots.current.add(key)
+    return key
+  }, [])
+
+  // Post a message down into the preview overlay (host → overlay channel).
+  const postToOverlay = useCallback((msg) => {
+    try {
+      iframeRef.current?.contentWindow?.postMessage({ source: 'kiro-ste-host', ...msg }, '*')
+    } catch { /* iframe not ready */ }
+  }, [])
+
+  const summarizeEl = useCallback((payload) => {
+    const el = payload?.selection?.elements?.[0] || {}
+    let name = el.tag || ''
+    if (el.id) name += `#${el.id}`
+    else if (el.classes?.length) name += '.' + el.classes.slice(0, 2).join('.')
+    return name
+  }, [])
 
   // Resizable left rail — default 500px, persisted, clamped 360–800.
   const [railW, setRailW] = useState(() => {
@@ -165,21 +280,6 @@ export default function PokeAndProse() {
     const t = setInterval(refresh, 5000)
     return () => clearInterval(t)
   }, [refresh])
-
-  // Captures from the overlay inside the iframe.
-  useEffect(() => {
-    async function onMsg(e) {
-      const d = e?.data
-      if (!d || d.source !== 'kiro-select-to-edit' || !d.payload) return
-      try {
-        const out = await api.post(`${API_BASE}/submit`, d.payload)
-        setStatus(out?.ok ? `Captured "${d.payload.comment}"` : `Capture failed: ${out?.error}`)
-        refresh()
-      } catch (err) { setStatus(`Capture failed: ${err?.message || err}`) }
-    }
-    window.addEventListener('message', onMsg)
-    return () => window.removeEventListener('message', onMsg)
-  }, [api, refresh])
 
   const switchTo = useCallback((p) => {
     if (!p) return
@@ -255,36 +355,156 @@ export default function PokeAndProse() {
     } catch (err) { setStatus(`Update failed: ${err?.message || err}`) }
   }, [api])
 
-  const sendToAgent = useCallback((item) => {
+  const sendToAgent = useCallback(async (item, followupText) => {
+    const instruction = followupText
+      ? `Follow-up on Poke & Prose request #${item.number} (id ${item.id}): "${followupText}".`
+      : `Apply Poke & Prose edit request #${item.number} (id ${item.id}): "${item.comment}".`
     const msg =
-      `Apply the pending Poke & Prose edit request (id ${item.id}, #${item.number}): "${item.comment}". ` +
+      `${instruction} ` +
       `Read the payload at ~/.kiroclaw/apps/poke-and-prose/data/queue/${item.id}.json — it includes ` +
-      `projectRoot and sourceFile, so edit that file directly (no searching), then clear the request ` +
-      `(POST ${API_BASE}/clear?id=${item.id}).`
+      `projectRoot and sourceFile, so edit that file directly (no searching). ` +
+      `As you work, POST short progress notes to ${API_BASE}/thread?id=${item.id} with body ` +
+      `{"role":"agent","text":"…"} so they show up on the in-preview comment pin. ` +
+      `When finished, POST a final note {"role":"agent","text":"done — <what changed>","status":"done"}.`
+
+    // Route into THIS web app's dedicated session (one persistent slot per app
+    // path), so all its requests are turns in the same conversation.
+    const proj = projects.find((p) => p.id === previewId)
+    const path = item.projectRoot || proj?.path || ''
+    const label = proj?.name || 'app'
     try {
-      openChat({ message: msg })
+      if (path) {
+        const key = await ensureSlot(path, label)
+        await chatApi('/api/chat', 'POST', { message: msg, slot: key, agent: '' })
+        setStatus(`Sent #${item.number} → ${label} session.`)
+      } else {
+        openChat({ message: msg })
+        setStatus(`Sent #${item.number} to the agent.`)
+      }
       api.post(`${API_BASE}/mark-sent?id=${item.id}`, {}).catch(() => {})
-      setStatus(`Sent #${item.number} to the agent.`)
       refresh()
-    } catch { setStatus('Copy this into chat: ' + msg) }
-  }, [api, openChat, refresh])
+    } catch (err) {
+      // Chat API unreachable → fall back to the launcher (host's active session).
+      try {
+        openChat({ message: msg })
+        api.post(`${API_BASE}/mark-sent?id=${item.id}`, {}).catch(() => {})
+        setStatus(`Sent #${item.number} (fallback).`)
+        refresh()
+      } catch { setStatus('Copy this into chat: ' + msg) }
+    }
+  }, [api, openChat, refresh, projects, previewId, ensureSlot])
+
+  // Messages from the in-preview overlay (overlay → panel channel).
+  useEffect(() => {
+    async function onMsg(e) {
+      const d = e?.data
+      if (!d || d.source !== 'kiro-select-to-edit') return
+
+      // New comment captured on an element → create the request, ack the pin,
+      // and (comment-instant-send) dispatch it to the agent right away.
+      if (d.type === 'capture' && d.payload) {
+        try {
+          const out = await api.post(`${API_BASE}/submit`, d.payload)
+          if (out?.ok) {
+            const item = { id: out.id, number: out.number, comment: d.payload.comment }
+            postToOverlay({
+              type: 'created', clientRef: d.clientRef, id: out.id, number: out.number,
+              status: 'sent', element: summarizeEl(d.payload),
+              locator: d.payload?.selection?.elements?.[0]?.locator || '',
+              thread: [{ role: 'user', text: d.payload.comment }],
+            })
+            sendToAgent(item)
+          } else setStatus(`Capture failed: ${out?.error}`)
+        } catch (err) { setStatus(`Capture failed: ${err?.message || err}`) }
+        return
+      }
+
+      // (Re)send an existing request, optionally with a follow-up comment.
+      if (d.type === 'dispatch' && d.id) {
+        try {
+          if (d.text) {
+            await api.post(`${API_BASE}/thread?id=${d.id}`, { role: 'user', text: d.text }).catch(() => {})
+          }
+          const item = pendingRef.current.find((x) => x.id === d.id) || { id: d.id, number: '', comment: '' }
+          sendToAgent(item, d.text)
+        } catch (err) { setStatus(`Send failed: ${err?.message || err}`) }
+        return
+      }
+    }
+    window.addEventListener('message', onMsg)
+    return () => window.removeEventListener('message', onMsg)
+  }, [api, sendToAgent, postToOverlay, summarizeEl])
+
+  // Push the current preview's requests down to the overlay so it can render
+  // pins + threads. Fires whenever the queue or the previewed app changes.
+  useEffect(() => {
+    if (!previewId) return
+    const items = pending.filter((it) => (it.previewUrl || '').includes(`/proxy/${previewId}/`))
+    postToOverlay({ type: 'requests', items })
+  }, [pending, previewId, postToOverlay])
+
+  const [hoverReqId, setHoverReqId] = useState('')
+
+  // Click a request in the left rail → toggle its pin bubble open/closed.
+  const focusPin = useCallback((item) => {
+    if (item?.id) postToOverlay({ type: 'toggle', id: item.id })
+  }, [postToOverlay])
+
+  // Open the Chat tab AT this app's dedicated session (deterministic slot).
+  const openInChat = useCallback((item) => {
+    const proj = projects.find((p) => p.id === previewId)
+    const path = (item && item.projectRoot) || proj?.path || ''
+    navigate(path ? `/chat?sid=${encodeURIComponent(slotKeyFor(path))}` : '/chat')
+  }, [navigate, projects, previewId])
+
+  // Archive → move to History (backend /clear moves queue → handled/).
+  const archiveReq = useCallback(async (item) => {
+    try { await api.post(`${API_BASE}/clear?id=${item.id}`, {}); refresh() }
+    catch (err) { setStatus(`Archive failed: ${err?.message || err}`) }
+  }, [api, refresh])
+
+  // Delete → permanently remove the request and its pin.
+  const deleteReq = useCallback(async (item) => {
+    try { await api.post(`${API_BASE}/delete?id=${item.id}`, {}); refresh() }
+    catch (err) { setStatus(`Delete failed: ${err?.message || err}`) }
+  }, [api, refresh])
+
+  // Auto-reload the preview when a request for the current app finishes, so the
+  // agent's edit shows without a manual refresh. Fires only on the →done edge.
+  useEffect(() => {
+    const prev = seenStatusRef.current
+    const cur = {}
+    let doneNow = null
+    for (const it of pending) {
+      cur[it.id] = it.status
+      const belongs = (it.previewUrl || '').includes(`/proxy/${previewId}/`)
+      if (belongs && it.status === 'done' && prev && prev[it.id] && prev[it.id] !== 'done') {
+        doneNow = it
+      }
+    }
+    seenStatusRef.current = cur
+    if (prev && doneNow && previewId) {
+      setPreviewNonce(Date.now())     // bump iframe src → reload; pins re-anchor on load
+      setStatus(`Preview refreshed — #${doneNow.number} done`)
+    }
+  }, [pending, previewId])
+
 
   const setEditMode = useCallback((m) => {
     setMode(m)
     try {
-      // Resolve the live theme tokens so the in-page overlay matches KiroClaw.
+      // Resolve the live theme tokens so the in-page overlay matches the host.
       const cs = getComputedStyle(document.documentElement)
+      const v = (n) => cs.getPropertyValue(n).trim()
       const theme = {
-        accent: cs.getPropertyValue('--accent').trim(),
-        panel: cs.getPropertyValue('--panel').trim(),
-        text: cs.getPropertyValue('--text').trim(),
-        border: cs.getPropertyValue('--border').trim(),
-        info: cs.getPropertyValue('--info').trim(),
+        accent: v('--accent'), accentFg: v('--accent-fg'), panel: v('--panel'),
+        card: v('--card'), bgElevated: v('--bg-elevated'),
+        text: v('--text'), textStrong: v('--text-strong'), muted: v('--muted'),
+        border: v('--border'), info: v('--info'), ok: v('--ok'), warn: v('--warn'),
       }
-      iframeRef.current?.contentWindow?.postMessage(
-        { source: 'kiro-ste-host', editMode: m === 'edit', theme }, '*')
+      postToOverlay({ type: 'state', editMode: m === 'edit', theme })
     } catch { /* iframe not ready */ }
-  }, [])
+  }, [postToOverlay])
 
   // ---------- render ----------
   const segBtn = (active) =>
@@ -421,7 +641,15 @@ export default function PokeAndProse() {
                 ? h('div', { className: 'py-6 text-[13px] text-muted' },
                     'No edit requests yet. Connect a web app, switch the preview to Edit mode, right-click an element, and describe the change.')
                 : pending.slice().reverse().map((it) =>
-                    h(RequestCard, { key: it.id, item: it, done: false, onSend: sendToAgent })),
+                    h(RequestCard, {
+                      key: it.id, item: it, done: false,
+                      onFocus: focusPin,
+                      hovered: hoverReqId === it.id,
+                      onHover: setHoverReqId,
+                      onOpenChat: openInChat,
+                      onArchive: archiveReq,
+                      onDelete: deleteReq,
+                    })),
             ),
 
             // History — pinned to the bottom, expands UPWARD when opened
@@ -431,11 +659,12 @@ export default function PokeAndProse() {
                 style: { maxHeight: '38vh' },
               },
                 history.map((it) =>
-                  h(RequestCard, { key: it.id, item: it, done: true, onSend: () => {} })),
+                  h(RequestCard, { key: it.id, item: it, done: true })),
               ),
               h('button', {
                 onClick: () => setHistOpen(!histOpen),
-                className: 'w-full flex items-center gap-2 px-5 py-3 text-[15px] font-bold text-text cursor-pointer hover:bg-bg-elevated/40',
+                className: 'w-full flex items-center gap-2 px-5 text-[15px] font-bold text-text cursor-pointer hover:bg-bg-elevated/40',
+                style: { height: '56px' },   // match the right-panel action bar height
               },
                 h(histOpen ? ChevronDown : ChevronRight, { size: 16, className: 'text-muted' }),
                 h(HistoryIcon, { size: 15, className: 'text-muted' }), 'History',
@@ -464,7 +693,11 @@ export default function PokeAndProse() {
             h('iframe', {
               ref: iframeRef,
               src: `${API_BASE}/proxy/${previewId}/?_t=${previewNonce}`,
-              onLoad: () => setEditMode(mode),
+              onLoad: () => {
+                setEditMode(mode)
+                const items = pending.filter((it) => (it.previewUrl || '').includes(`/proxy/${previewId}/`))
+                postToOverlay({ type: 'requests', items })
+              },
               title: 'preview',
               style: {
                 width: DIMS[dims], height: '100%', border: '1px solid var(--border, #4a464f)',
@@ -476,10 +709,10 @@ export default function PokeAndProse() {
         : h('div', { className: 'flex-1 flex items-center justify-center text-muted text-sm px-10 text-center' },
             'No web app selected. Pick one in the dropdown — switching is instant.'),
 
-      // bottom: action bar (fixed, 44px — same as collapsed History header)
+      // bottom: action bar (fixed, 56px — 40px tab pill + 8px gap to each bar edge; matches History header)
       h('div', {
         className: 'shrink-0 flex items-center justify-between px-3',
-        style: { height: '44px', borderTop: '1px solid var(--border)' },
+        style: { height: '56px', borderTop: '1px solid var(--border)' },
       },
         // dimensions selector
         h('div', { className: 'relative' },
@@ -503,18 +736,32 @@ export default function PokeAndProse() {
             }, k[0].toUpperCase() + k.slice(1) + (k === 'desktop' ? '' : ` (${DIMS[k]})`))),
           ),
         ),
-        // preview / edit toggle
-        h('div', { className: 'flex p-0.5 rounded-xl', style: { background: 'var(--panel)' } },
+        // refresh + preview/edit toggle
+        h('div', { className: 'flex items-center gap-2' },
           h('button', {
-            onClick: () => setEditMode('preview'),
-            className: segBtn(mode === 'preview') + ' px-3',
-            style: segStyle(mode === 'preview'),
-          }, h(Eye, { size: 14 }), 'Preview'),
-          h('button', {
-            onClick: () => setEditMode('edit'),
-            className: segBtn(mode === 'edit') + ' px-3',
-            style: segStyle(mode === 'edit'),
-          }, h(Pencil, { size: 14 }), 'Edit'),
+            title: 'Refresh preview',
+            onClick: () => previewId && setPreviewNonce(Date.now()),
+            disabled: !previewId,
+            className: 'p-2 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer disabled:opacity-40',
+          }, h(RefreshCw, { size: 15 })),
+          h('div', {
+            className: 'flex items-center gap-1',
+            style: {
+              background: 'rgba(0,0,0,0.25)',   // theme-agnostic "darker" recessed track
+              borderRadius: '14px', border: '1px solid var(--border)', padding: '4px',
+            },
+          },
+            h('button', {
+              onClick: () => setEditMode('preview'),
+              className: `flex items-center justify-center gap-1.5 h-8 px-3 text-[13px] font-bold cursor-pointer transition-all ${mode === 'preview' ? 'text-accent-fg' : 'text-text hover:text-text'}`,
+              style: { borderRadius: '10px', background: mode === 'preview' ? 'var(--accent)' : 'transparent' },
+            }, h(Eye, { size: 14 }), 'Preview'),
+            h('button', {
+              onClick: () => setEditMode('edit'),
+              className: `flex items-center justify-center gap-1.5 h-8 px-3 text-[13px] font-bold cursor-pointer transition-all ${mode === 'edit' ? 'text-accent-fg' : 'text-text hover:text-text'}`,
+              style: { borderRadius: '10px', background: mode === 'edit' ? 'var(--accent)' : 'transparent' },
+            }, h(Pencil, { size: 14 }), 'Edit'),
+          ),
         ),
       ),
     ),
