@@ -1,13 +1,13 @@
-// Poke & Prose — dashboard page (federated ESM, no build step).
+// Design Tweak — dashboard page (federated ESM, no build step).
 // Design source: Figma "Michelle Playground" frame 232:2123 (see design/).
 // Two-panel layout inside KiroClaw's content area: 450px left rail + preview.
 
-const React = window.__kiroclaw_modules.react
-const { useAppApi, useChatLauncher, useNavigate } = window.__kiroclaw_modules['@kiroclaw/app-sdk']
+const React = window.__kirocrew_modules.react
+const { useAppApi, useChatLauncher, useNavigate } = window.__kirocrew_modules['@kirocrew/app-sdk']
 const {
-  MousePointerClick, RefreshCw, ChevronDown, ChevronRight,
-  Send, Folder, Plus, Monitor, Eye, Pencil, History: HistoryIcon, X,
-} = window.__kiroclaw_modules['lucide-react']
+  RefreshCw, ChevronDown, ChevronRight, Folder, FolderOpen,
+  Send, Plus, Monitor, Eye, Pencil, History: HistoryIcon, X,
+} = window.__kirocrew_modules['lucide-react']
 
 const { useState, useEffect, useCallback, useRef, createElement: h } = React
 
@@ -78,76 +78,166 @@ function timeAgo(iso) {
   return `${Math.round(s / 86400)} d ago`
 }
 
-const CHIP = {
-  new:  { label: 'new',        fg: 'var(--warn)',   bg: 'var(--warn-subtle)' },
-  sent: { label: 'in progress', fg: 'var(--accent)', bg: 'var(--accent-subtle)' },
-  done: { label: 'done',       fg: 'var(--ok)',     bg: 'var(--ok-subtle)' },
+// Request-level chip. A request's status is derived from its comments, so the
+// in-progress label doubles as a progress read-out ("1 of 3 done").
+function reqChip(req) {
+  const n = (req.comments || []).length
+  if (req.status === 'draft') return { label: 'draft · not sent', fg: 'var(--muted)', bg: 'var(--bg-elevated)' }
+  if (req.status === 'done') return { label: 'done', fg: 'var(--ok)', bg: 'var(--ok-subtle)' }
+  return { label: `${req.doneCount || 0} of ${n} done`, fg: 'var(--accent)', bg: 'var(--accent-subtle)' }
 }
 
-function Chip({ status }) {
-  const c = CHIP[status] || CHIP.new
-  return h('span', {
-    className: 'text-[11px] px-2 py-[2px] rounded-full font-medium',
-    style: { color: c.fg, background: c.bg },
-  }, c.label)
+// Per-comment status dot — the Option B "status-forward" cue.
+const DOT = {
+  new:  'var(--warn)',
+  sent: 'var(--accent)',
+  done: 'var(--ok)',
 }
 
-function RequestCard({ item, done, onFocus, hovered, onHover, onOpenChat, onArchive, onDelete }) {
-  const thread = Array.isArray(item.thread) ? item.thread : []
+// Sessions' collapse mechanic: a grid that animates 1fr <-> 0fr, children stay
+// mounted (ChatSidebar.tsx FolderBody).
+function FolderBody({ open, children }) {
+  return h('div', {
+    style: {
+      display: 'grid',
+      gridTemplateRows: open ? '1fr' : '0fr',
+      transition: 'grid-template-rows 0.15s ease-out',
+    },
+  }, h('div', {
+    style: {
+      overflow: 'hidden',
+      visibility: open ? 'visible' : 'hidden',
+      padding: open ? '2px' : 0,
+    },
+    inert: open ? undefined : '',
+  }, children))
+}
+
+// One comment = one sub-item under a request. Geometry matches a Sessions
+// session row (items-start gap-2.5 px-4 py-2 rounded-md).
+function CommentRow({ req, c, hovered, onHover, onFocus, onDelete, done }) {
+  const thread = Array.isArray(c.thread) ? c.thread : []
   const lastAgent = thread.slice().reverse().find((m) => m && m.role !== 'user')
+  const label = `${req.number}.${c.index}`
+  const canDelete = !done && req.state === 'draft'
 
-  // History cards (done) keep the original full-bleed look; only the sessions
-  // list gets the inset themed border + hover actions.
-  const containerClass = done
-    ? 'py-2 border-b border-border/60'
-    : 'py-2 border-b border-border cursor-pointer'
+  return h('div', {
+    className: 'flex items-start gap-2.5 px-4 py-2 rounded-md cursor-pointer transition-all hover:bg-bg-hover',
+    onClick: () => onFocus && onFocus(c),
+    onMouseEnter: () => onHover && onHover(c.cid),
+    onMouseLeave: () => onHover && onHover(''),
+    title: 'Click to open this comment in the preview',
+  },
+    h('span', {
+      className: 'rounded-full shrink-0',
+      style: { width: '7px', height: '7px', marginTop: '5px', background: DOT[c.status] || DOT.new },
+    }),
+    h('div', { className: 'flex-1 min-w-0' },
+      h('div', {
+        className: 'text-[13px] font-semibold leading-snug text-text',
+        style: { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
+      }, c.comment),
+      h('div', { className: 'text-[12px] text-muted leading-snug truncate mt-0.5' },
+        `${label} · ${c.element || `${c.count} elements`} · ${timeAgo(c.createdAt)}`),
+      c.followUpTo && h('div', { className: 'text-[11px] text-muted truncate mt-0.5' },
+        `↩ follow-up to ${c.followUpLabel || 'an earlier comment'}`),
+      lastAgent && h('div', {
+        className: 'text-[12px] text-muted mt-1 pl-2',
+        style: {
+          borderLeft: '2px solid var(--border)',
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+        },
+      }, lastAgent.text),
+    ),
+    canDelete && hovered && h('button', {
+      title: 'Remove this comment from the draft',
+      onClick: (e) => { e.stopPropagation(); onDelete(req, c) },
+      className: 'p-1 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer shrink-0',
+    }, h(TrashIcon, { size: 13 })),
+  )
+}
+
+// One request = a collapsible group. Row geometry matches a Sessions folder
+// header (gap-2 pr-2 py-1.5 pl-13px rounded-md, Folder/FolderOpen glyph swap).
+function RequestGroup({
+  req, open, onToggle, onSend, sending,
+  hoveredCid, onHoverComment, onFocusComment, onDeleteComment,
+  onOpenChat, onArchive, onDelete, hovered, onHover, done,
+}) {
+  const comments = req.comments || []
+  const chip = reqChip(req)
+  const isDraft = req.status === 'draft'
 
   const iconBtn = (title, icon, handler) => h('button', {
     title,
-    onClick: (e) => { e.stopPropagation(); handler(item) },
-    className: 'p-1.5 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
+    onClick: (e) => { e.stopPropagation(); handler(req) },
+    className: 'p-1 rounded-md text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
   }, icon)
 
-  return h('div', {
-    className: containerClass,
-    onClick: done ? undefined : () => onFocus && onFocus(item),
-    onMouseEnter: done ? undefined : () => onHover && onHover(item.id),
-    onMouseLeave: done ? undefined : () => onHover && onHover(''),
-    title: done ? undefined : 'Click to open/close this pin in the preview',
-  },
-    h('div', { className: 'flex items-center gap-1 text-[11px] text-muted' },
-      h('span', null, `#${item.number || '—'}`),
-      h('span', null, '·'),
-      h('span', { className: 'text-[12px]' }, item.element || `${item.count} elements`),
-      !done && item.status === 'new' &&
-        h('span', { className: 'w-[6px] h-[6px] rounded-full ml-1', style: { background: 'var(--danger)' } }),
-    ),
+  return h('div', { className: 'mb-0.5' },
+    // ---- request row (the "folder") ----
     h('div', {
-      className: 'text-[13px] text-text mt-0.5',
-      style: { display: '-webkit-box', WebkitLineClamp: 3, WebkitBoxOrient: 'vertical', overflow: 'hidden' },
-    }, item.comment),
-    lastAgent && h('div', {
-      className: 'text-[12px] text-muted mt-1 pl-2',
-      style: {
-        borderLeft: '2px solid var(--border)',
-        display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden',
+      className: 'group relative flex items-center gap-2 pr-2 py-1.5 rounded-md text-sm text-muted hover:text-text hover:bg-bg-hover transition-all cursor-pointer',
+      style: { paddingLeft: '13px' },
+      onClick: () => onToggle(req.id),
+      onMouseEnter: () => onHover && onHover(req.id),
+      onMouseLeave: () => onHover && onHover(''),
+    },
+      h(open ? FolderOpen : Folder, { size: 14, className: 'text-muted shrink-0' }),
+      h('span', { className: 'flex-1 text-[13px] font-medium text-text truncate text-left' },
+        `Request ${req.number}`),
+      h('span', {
+        className: 'text-[11px] px-2 py-[2px] rounded-full font-medium shrink-0',
+        style: { color: chip.fg, background: chip.bg },
+      }, chip.label),
+      h('span', {
+        className: 'text-[11px] text-muted shrink-0',
+        style: { fontVariantNumeric: 'tabular-nums' },
+      }, String(comments.length)),
+      !done && hovered && !isDraft && h('div', { className: 'flex items-center gap-0.5 shrink-0' },
+        iconBtn('Open in chat', h(ChatOpenIcon, { size: 13 }), onOpenChat),
+        iconBtn('Archive to History', h(ArchiveIcon, { size: 13 }), onArchive),
+        iconBtn('Delete request', h(TrashIcon, { size: 13 }), onDelete),
+      ),
+    ),
+
+    // ---- children: 12px indent + 1px guide rail (Sessions renderFolderBlock) ----
+    h(FolderBody, { open },
+      h('div', {
+        className: 'border-l border-border mb-1 ml-3 pl-1 rounded-bl-md',
       },
-    }, lastAgent.text),
-    h('div', { className: 'flex items-center gap-2 mt-1.5' },
-      h('span', { className: 'text-[12px] text-muted' }, `Updated ${timeAgo(item.createdAt)}`),
-      h(Chip, { status: done ? 'done' : item.status }),
-      h('span', { className: 'flex-1' }),
-      // Hover-only actions (sessions list only)
-      !done && hovered && h('div', { className: 'flex items-center gap-0.5' },
-        iconBtn('Open in chat', h(ChatOpenIcon, { size: 14 }), onOpenChat),
-        iconBtn('Archive to History', h(ArchiveIcon, { size: 14 }), onArchive),
-        iconBtn('Delete request', h(TrashIcon, { size: 14 }), onDelete),
+        comments.length === 0
+          ? h('div', { className: 'px-4 py-2 text-[12px] text-muted' }, 'No comments yet.')
+          : comments.map((c) => h(CommentRow, {
+              key: c.cid, req, c, done,
+              hovered: hoveredCid === c.cid,
+              onHover: onHoverComment,
+              onFocus: onFocusComment,
+              onDelete: onDeleteComment,
+            })),
+
+        // ---- send bar: full-width, inside the rail (Option B) ----
+        isDraft && comments.length > 0 && h('div', null,
+          h('div', { className: 'mx-3 mt-1 border-b border-border' }),
+          h('button', {
+            onClick: (e) => { e.stopPropagation(); onSend(req) },
+            disabled: !!sending,
+            className: 'w-full flex items-center justify-center gap-2 px-4 py-2 rounded-md text-[12px] font-semibold cursor-pointer mt-0.5 disabled:cursor-wait',
+            style: { background: 'var(--accent)', color: 'var(--accent-fg)', opacity: sending ? 0.7 : 1, border: 0 },
+          },
+            h(Send, { size: 13 }),
+            sending
+              ? 'Sending…'
+              : `Send ${comments.length} comment${comments.length > 1 ? 's' : ''} as Request ${req.number}`,
+          ),
+        ),
       ),
     ),
   )
 }
 
-export default function PokeAndProse() {
+
+export default function DesignTweak() {
   const api = useAppApi()
   const { openChat } = useChatLauncher()
   const navigate = useNavigate()
@@ -160,7 +250,6 @@ export default function PokeAndProse() {
   const [ddOpen, setDdOpen] = useState(false)
   const [adding, setAdding] = useState(false)
   const [newPath, setNewPath] = useState('')
-  const [tab, setTab] = useState('requests')
   const [pending, setPending] = useState([])
   const [history, setHistory] = useState([])
   const [histOpen, setHistOpen] = useState(false)
@@ -182,11 +271,41 @@ export default function PokeAndProse() {
   }, [])
   const [mode, setMode] = useState('preview')
   const [status, setStatus] = useState('')
+  const [reqOpen, setReqOpen] = useState({})     // requestId -> expanded?
+  const [sendingId, setSendingId] = useState('') // request currently being sent
+  const [hoverReqId, setHoverReqId] = useState('')
+  const [hoverCid, setHoverCid] = useState('')
   const iframeRef = useRef(null)
-  const pendingRef = useRef([])
-  useEffect(() => { pendingRef.current = pending }, [pending])
-  // Tracks each request's last-seen status so we can auto-reload the preview
-  // exactly once when a request for the current app transitions to "done".
+
+  // cid -> { req, comment } across pending AND history, so a follow-up can
+  // resolve its origin comment even after that request was archived.
+  const commentIndexRef = useRef({})
+  useEffect(() => {
+    const idx = {}
+    for (const req of [...pending, ...history]) {
+      for (const c of req.comments || []) idx[c.cid] = { req, comment: c }
+    }
+    commentIndexRef.current = idx
+  }, [pending, history])
+
+  // Label a follow-up by its origin ("3.1") rather than a raw cid.
+  const withFollowUpLabels = useCallback((reqs) => reqs.map((req) => ({
+    ...req,
+    comments: (req.comments || []).map((c) => {
+      if (!c.followUpTo) return c
+      const origin = commentIndexRef.current[c.followUpTo]
+      return origin
+        ? { ...c, followUpLabel: `${origin.req.number}.${origin.comment.index}` }
+        : c
+    }),
+  })), [])
+
+  const toggleReq = useCallback((id) => {
+    setReqOpen((m) => ({ ...m, [id]: !m[id] }))
+  }, [])
+
+  // Tracks each comment's last-seen status so we can auto-reload the preview
+  // exactly once when a comment for the current app transitions to "done".
   const seenStatusRef = useRef(null)
 
   // Which per-app chat slots we've already ensured exist (this panel session).
@@ -200,7 +319,7 @@ export default function PokeAndProse() {
     if (!exists) {
       await chatApi('/api/chat/slots', 'POST', { name: key, agent: '' })
       const seed =
-        `Poke & Prose session for "${label}". Working directory: ${path}\n` +
+        `Design Tweak session for "${label}". Working directory: ${path}\n` +
         `You handle visual edit requests for this web app. For each request, edit the ` +
         `exact source file, then post a one-line summary. Keep responses concise.`
       try { await chatApi('/api/chat', 'POST', { message: seed, slot: key, agent: '' }) } catch { /* ignore */ }
@@ -355,42 +474,67 @@ export default function PokeAndProse() {
     } catch (err) { setStatus(`Update failed: ${err?.message || err}`) }
   }, [api])
 
-  const sendToAgent = useCallback(async (item, followupText) => {
-    const instruction = followupText
-      ? `Follow-up on Poke & Prose request #${item.number} (id ${item.id}): "${followupText}".`
-      : `Apply Poke & Prose edit request #${item.number} (id ${item.id}): "${item.comment}".`
-    const msg =
-      `${instruction} ` +
-      `Read the payload at ~/.kiroclaw/apps/poke-and-prose/data/queue/${item.id}.json — it includes ` +
-      `projectRoot and sourceFile, so edit that file directly (no searching). ` +
-      `As you work, POST short progress notes to ${API_BASE}/thread?id=${item.id} with body ` +
-      `{"role":"agent","text":"…"} so they show up on the in-preview comment pin. ` +
-      `When finished, POST a final note {"role":"agent","text":"done — <what changed>","status":"done"}.`
-
-    // Route into THIS web app's dedicated session (one persistent slot per app
-    // path), so all its requests are turns in the same conversation.
-    const proj = projects.find((p) => p.id === previewId)
-    const path = item.projectRoot || proj?.path || ''
-    const label = proj?.name || 'app'
+  // Seal a draft request and hand the WHOLE batch to the agent as one prompt.
+  // Seal-on-send: after this the request never accepts comments again, so the
+  // next capture opens a fresh draft even while this batch is still running.
+  const sendRequest = useCallback(async (req) => {
+    const comments = req.comments || []
+    if (!comments.length) return
+    setSendingId(req.id)
     try {
-      if (path) {
-        const key = await ensureSlot(path, label)
-        await chatApi('/api/chat', 'POST', { message: msg, slot: key, agent: '' })
-        setStatus(`Sent #${item.number} → ${label} session.`)
-      } else {
-        openChat({ message: msg })
-        setStatus(`Sent #${item.number} to the agent.`)
+      const sealed = await api.post(`${API_BASE}/send?id=${req.id}`, {})
+      if (!sealed?.ok) {
+        setStatus(`Send failed: ${sealed?.error || 'unknown'}`)
+        setSendingId('')
+        return
       }
-      api.post(`${API_BASE}/mark-sent?id=${item.id}`, {}).catch(() => {})
+
+      const list = comments.map((c) => {
+        const fu = c.followUpTo ? ` (follow-up to comment ${c.followUpTo})` : ''
+        return `  ${req.number}.${c.index} [cid ${c.cid}]${fu}\n` +
+               `      element: ${c.element || `${c.count} elements`}${c.locator ? `  locator: ${c.locator}` : ''}\n` +
+               `      file:    ${c.sourceFile || '(unknown — verify before editing)'}\n` +
+               `      change:  "${c.comment}"`
+      }).join('\n')
+
+      const msg =
+        `Apply Design Tweak request #${req.number} — ${comments.length} comment${comments.length > 1 ? 's' : ''} ` +
+        `(request id ${req.id}).\n\n${list}\n\n` +
+        `The full payload is at ~/.kirocrew/apps/poke-and-prose/data/queue/${req.id}.json — ` +
+        `its \`comments\` array carries each comment's \`cid\`, \`sourceFile\`, and \`selection\`, ` +
+        `so edit those files directly without searching.\n` +
+        `Work the comments one at a time. For EACH comment, POST progress to ` +
+        `${API_BASE}/thread?id=${req.id}&cid=<cid> with {"role":"agent","text":"…"}, ` +
+        `and when that comment is finished POST ` +
+        `{"role":"agent","text":"done — <what changed>","status":"done"}. ` +
+        `Report per comment, not once for the batch — each comment has its own progress bubble.\n` +
+        `A comment marked as a follow-up refers to an earlier comment's cid; read that comment's ` +
+        `thread in the same file (or in ../handled/) for context before editing.`
+
+      // Route into THIS web app's dedicated session so every request for the
+      // app is a turn in the same conversation.
+      const proj = projects.find((p) => p.id === previewId)
+      const path = req.projectRoot || proj?.path || ''
+      const label = proj?.name || 'app'
+      try {
+        if (path) {
+          const key = await ensureSlot(path, label)
+          await chatApi('/api/chat', 'POST', { message: msg, slot: key, agent: '' })
+          setStatus(`Sent Request ${req.number} (${comments.length}) → ${label} session.`)
+        } else {
+          openChat({ message: msg })
+          setStatus(`Sent Request ${req.number} to the agent.`)
+        }
+      } catch {
+        // Chat API unreachable → fall back to the host's active session.
+        openChat({ message: msg })
+        setStatus(`Sent Request ${req.number} (fallback).`)
+      }
       refresh()
     } catch (err) {
-      // Chat API unreachable → fall back to the launcher (host's active session).
-      try {
-        openChat({ message: msg })
-        api.post(`${API_BASE}/mark-sent?id=${item.id}`, {}).catch(() => {})
-        setStatus(`Sent #${item.number} (fallback).`)
-        refresh()
-      } catch { setStatus('Copy this into chat: ' + msg) }
+      setStatus(`Send failed: ${err?.message || err}`)
+    } finally {
+      setSendingId('')
     }
   }, [api, openChat, refresh, projects, previewId, ensureSlot])
 
@@ -400,54 +544,80 @@ export default function PokeAndProse() {
       const d = e?.data
       if (!d || d.source !== 'kiro-select-to-edit') return
 
-      // New comment captured on an element → create the request, ack the pin,
-      // and (comment-instant-send) dispatch it to the agent right away.
+      // New comment captured on an element → append it to the project's open
+      // draft request and ack the pin. Nothing is dispatched: sending the batch
+      // is an explicit, separate step.
       if (d.type === 'capture' && d.payload) {
         try {
           const out = await api.post(`${API_BASE}/submit`, d.payload)
           if (out?.ok) {
-            const item = { id: out.id, number: out.number, comment: d.payload.comment }
             postToOverlay({
-              type: 'created', clientRef: d.clientRef, id: out.id, number: out.number,
-              status: 'sent', element: summarizeEl(d.payload),
+              type: 'created', clientRef: d.clientRef,
+              id: out.cid,                       // overlay keys pins by comment
+              number: out.label,                 // "3.1"
+              status: 'new', element: summarizeEl(d.payload),
               locator: d.payload?.selection?.elements?.[0]?.locator || '',
               thread: [{ role: 'user', text: d.payload.comment }],
             })
-            sendToAgent(item)
+            setReqOpen((m) => ({ ...m, [out.id]: true }))   // reveal the draft
+            setStatus(`Added ${out.label} — ${out.commentCount} in Request ${out.number}, not sent yet.`)
+            refresh()
           } else setStatus(`Capture failed: ${out?.error}`)
         } catch (err) { setStatus(`Capture failed: ${err?.message || err}`) }
         return
       }
 
-      // (Re)send an existing request, optionally with a follow-up comment.
-      if (d.type === 'dispatch' && d.id) {
+      // Reply typed on an existing comment's pin → a NEW comment in the CURRENT
+      // draft, linked back via followUpTo. The already-sent request is untouched.
+      if (d.type === 'dispatch' && d.id && d.text) {
         try {
-          if (d.text) {
-            await api.post(`${API_BASE}/thread?id=${d.id}`, { role: 'user', text: d.text }).catch(() => {})
-          }
-          const item = pendingRef.current.find((x) => x.id === d.id) || { id: d.id, number: '', comment: '' }
-          sendToAgent(item, d.text)
-        } catch (err) { setStatus(`Send failed: ${err?.message || err}`) }
+          const origin = commentIndexRef.current[d.id]
+          if (!origin) { setStatus('Could not find that comment to follow up on.'); return }
+          const out = await api.post(`${API_BASE}/submit`, {
+            type: 'visual_edit_request',
+            comment: d.text,
+            followUpTo: d.id,
+            previewUrl: origin.comment.previewUrl,
+            selection: { mode: 'single', elements: [{ locator: origin.comment.locator }] },
+          })
+          if (out?.ok) {
+            setReqOpen((m) => ({ ...m, [out.id]: true }))
+            setStatus(`Follow-up ${out.label} added to Request ${out.number} — not sent yet.`)
+            refresh()
+          } else setStatus(`Follow-up failed: ${out?.error}`)
+        } catch (err) { setStatus(`Follow-up failed: ${err?.message || err}`) }
         return
       }
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
-  }, [api, sendToAgent, postToOverlay, summarizeEl])
+  }, [api, postToOverlay, summarizeEl, refresh])
 
-  // Push the current preview's requests down to the overlay so it can render
-  // pins + threads. Fires whenever the queue or the previewed app changes.
+  // Push the previewed app's COMMENTS down to the overlay as pins. The overlay
+  // keys a pin by `id`, so each comment's cid becomes its pin id.
   useEffect(() => {
     if (!previewId) return
-    const items = pending.filter((it) => (it.previewUrl || '').includes(`/proxy/${previewId}/`))
+    const items = []
+    for (const req of pending) {
+      for (const c of req.comments || []) {
+        if (!(c.previewUrl || '').includes(`/proxy/${previewId}/`)) continue
+        items.push({
+          id: c.cid,
+          number: `${req.number}.${c.index}`,
+          status: c.status,
+          comment: c.comment,
+          element: c.element,
+          locator: c.locator,
+          thread: c.thread || [],
+        })
+      }
+    }
     postToOverlay({ type: 'requests', items })
   }, [pending, previewId, postToOverlay])
 
-  const [hoverReqId, setHoverReqId] = useState('')
-
-  // Click a request in the left rail → toggle its pin bubble open/closed.
-  const focusPin = useCallback((item) => {
-    if (item?.id) postToOverlay({ type: 'toggle', id: item.id })
+  // Click a comment in the left rail → toggle its pin bubble open/closed.
+  const focusComment = useCallback((c) => {
+    if (c?.cid) postToOverlay({ type: 'toggle', id: c.cid })
   }, [postToOverlay])
 
   // Open the Chat tab AT this app's dedicated session (deterministic slot).
@@ -458,34 +628,45 @@ export default function PokeAndProse() {
   }, [navigate, projects, previewId])
 
   // Archive → move to History (backend /clear moves queue → handled/).
-  const archiveReq = useCallback(async (item) => {
-    try { await api.post(`${API_BASE}/clear?id=${item.id}`, {}); refresh() }
+  const archiveReq = useCallback(async (req) => {
+    try { await api.post(`${API_BASE}/clear?id=${req.id}`, {}); refresh() }
     catch (err) { setStatus(`Archive failed: ${err?.message || err}`) }
   }, [api, refresh])
 
-  // Delete → permanently remove the request and its pin.
-  const deleteReq = useCallback(async (item) => {
-    try { await api.post(`${API_BASE}/delete?id=${item.id}`, {}); refresh() }
+  // Delete → permanently remove the request, its comments, and their pins.
+  const deleteReq = useCallback(async (req) => {
+    try { await api.post(`${API_BASE}/delete?id=${req.id}`, {}); refresh() }
     catch (err) { setStatus(`Delete failed: ${err?.message || err}`) }
   }, [api, refresh])
 
-  // Auto-reload the preview when a request for the current app finishes, so the
+  // Remove one comment from a draft (backend refuses once the request is sent).
+  const deleteComment = useCallback(async (req, c) => {
+    try {
+      const out = await api.post(`${API_BASE}/delete-comment?id=${req.id}&cid=${c.cid}`, {})
+      if (out?.error) setStatus(out.error)
+      refresh()
+    } catch (err) { setStatus(`Remove failed: ${err?.message || err}`) }
+  }, [api, refresh])
+
+  // Auto-reload the preview when a COMMENT for the current app finishes, so the
   // agent's edit shows without a manual refresh. Fires only on the →done edge.
   useEffect(() => {
     const prev = seenStatusRef.current
     const cur = {}
     let doneNow = null
-    for (const it of pending) {
-      cur[it.id] = it.status
-      const belongs = (it.previewUrl || '').includes(`/proxy/${previewId}/`)
-      if (belongs && it.status === 'done' && prev && prev[it.id] && prev[it.id] !== 'done') {
-        doneNow = it
+    for (const req of pending) {
+      for (const c of req.comments || []) {
+        cur[c.cid] = c.status
+        const belongs = (c.previewUrl || '').includes(`/proxy/${previewId}/`)
+        if (belongs && c.status === 'done' && prev && prev[c.cid] && prev[c.cid] !== 'done') {
+          doneNow = { label: `${req.number}.${c.index}` }
+        }
       }
     }
     seenStatusRef.current = cur
     if (prev && doneNow && previewId) {
       setPreviewNonce(Date.now())     // bump iframe src → reload; pins re-anchor on load
-      setStatus(`Preview refreshed — #${doneNow.number} done`)
+      setStatus(`Preview refreshed — ${doneNow.label} done`)
     }
   }, [pending, previewId])
 
@@ -507,12 +688,6 @@ export default function PokeAndProse() {
   }, [postToOverlay])
 
   // ---------- render ----------
-  const segBtn = (active) =>
-    `flex-1 flex items-center justify-center gap-1.5 h-8 text-[13px] font-bold cursor-pointer transition-all ${
-      active ? 'text-accent-fg' : 'text-muted hover:text-text'}`
-  const segStyle = (active) =>
-    active ? { background: 'var(--accent)', borderRadius: '12px' } : { borderRadius: '12px' }
-
   return h('div', { className: 'flex h-full min-h-0', style: { padding: '12px' } },
 
     // ================= LEFT RAIL (resizable, bordered container) =================
@@ -529,7 +704,7 @@ export default function PokeAndProse() {
       // header
       h('div', { className: 'flex items-start gap-3 px-5 pt-4 pb-2' },
         h('div', { className: 'flex-1 min-w-0' },
-          h('div', { className: 'text-[20px] font-bold text-text-strong leading-tight' }, 'Poke & Prose'),
+          h('div', { className: 'text-[20px] font-bold text-text-strong leading-tight' }, 'Design Tweak'),
           h('div', { className: 'text-[12px] text-muted mt-0.5' }, 'Point, describe, and watch the code catch up.'),
         ),
         h('button', {
@@ -613,65 +788,61 @@ export default function PokeAndProse() {
         ),
       ),
 
-      // tabs
-      h('div', { className: 'px-5 py-2' },
-        h('div', { className: 'flex p-1 rounded-2xl bg-bg-elevated border border-border' },
-          h('button', {
-            onClick: () => setTab('requests'),
-            className: segBtn(tab === 'requests'),
-            style: segStyle(tab === 'requests'),
-          }, h(MousePointerClick, { size: 15 }), 'Edit Requests'),
-          h('button', {
-            onClick: () => setTab('resources'),
-            className: segBtn(tab === 'resources'),
-            style: segStyle(tab === 'resources'),
-          }, h(Pencil, { size: 14 }), 'Design Resource'),
-        ),
-      ),
-
       status && h('div', { className: 'px-5 py-1 text-[11px] text-muted truncate' }, status),
 
-      // tab content
-      tab === 'resources'
-        ? h('div', { className: 'flex-1 flex items-center justify-center text-muted text-sm' }, 'Coming soon')
-        : h('div', { className: 'flex-1 min-h-0 flex flex-col' },
-            // requests list (scrolls independently)
-            h('div', { className: 'flex-1 min-h-0 overflow-y-auto px-5' },
-              pending.length === 0
-                ? h('div', { className: 'py-6 text-[13px] text-muted' },
-                    'No edit requests yet. Connect a web app, switch the preview to Edit mode, right-click an element, and describe the change.')
-                : pending.slice().reverse().map((it) =>
-                    h(RequestCard, {
-                      key: it.id, item: it, done: false,
-                      onFocus: focusPin,
-                      hovered: hoverReqId === it.id,
-                      onHover: setHoverReqId,
-                      onOpenChat: openInChat,
-                      onArchive: archiveReq,
-                      onDelete: deleteReq,
-                    })),
-            ),
+      // request tree + history (nesting mirrors the Sessions folder view)
+      h('div', { className: 'flex-1 min-h-0 flex flex-col' },
+        // request groups, newest first (scrolls independently)
+        h('div', { className: 'flex-1 min-h-0 overflow-y-auto px-2' },
+          pending.length === 0
+            ? h('div', { className: 'py-6 px-3 text-[13px] text-muted' },
+                'No edit requests yet. Connect a web app, switch the preview to Edit mode, right-click an element, and describe the change. Comments collect into a request — send them as one batch when you\'re done.')
+            : withFollowUpLabels(pending).slice().reverse().map((req) =>
+                h(RequestGroup, {
+                  key: req.id, req, done: false,
+                  open: reqOpen[req.id] !== false,   // expanded by default
+                  onToggle: toggleReq,
+                  onSend: sendRequest,
+                  sending: sendingId === req.id,
+                  hovered: hoverReqId === req.id,
+                  onHover: setHoverReqId,
+                  hoveredCid: hoverCid,
+                  onHoverComment: setHoverCid,
+                  onFocusComment: focusComment,
+                  onDeleteComment: deleteComment,
+                  onOpenChat: openInChat,
+                  onArchive: archiveReq,
+                  onDelete: deleteReq,
+                })),
+      ),
 
-            // History — pinned to the bottom, expands UPWARD when opened
-            h('div', { className: 'shrink-0 border-t border-border' },
-              histOpen && history.length > 0 && h('div', {
-                className: 'overflow-y-auto px-5 border-b border-border/60',
-                style: { maxHeight: '38vh' },
-              },
-                history.map((it) =>
-                  h(RequestCard, { key: it.id, item: it, done: true })),
-              ),
-              h('button', {
-                onClick: () => setHistOpen(!histOpen),
-                className: 'w-full flex items-center gap-2 px-5 text-[15px] font-bold text-text cursor-pointer hover:bg-bg-elevated/40',
-                style: { height: '56px' },   // match the right-panel action bar height
-              },
-                h(histOpen ? ChevronDown : ChevronRight, { size: 16, className: 'text-muted' }),
-                h(HistoryIcon, { size: 15, className: 'text-muted' }), 'History',
-                h('span', { className: 'text-[12px] text-muted font-normal' }, `(${history.length})`),
-              ),
-            ),
-          ),
+      // History — pinned to the bottom, expands UPWARD when opened
+      h('div', { className: 'shrink-0 border-t border-border' },
+        histOpen && history.length > 0 && h('div', {
+          className: 'overflow-y-auto px-2 border-b border-border/60',
+          style: { maxHeight: '38vh' },
+        },
+          withFollowUpLabels(history).map((req) =>
+            h(RequestGroup, {
+              key: req.id, req, done: true,
+              open: reqOpen[req.id] === true,        // collapsed by default
+              onToggle: toggleReq,
+              hoveredCid: hoverCid,
+              onHoverComment: setHoverCid,
+              onFocusComment: focusComment,
+            })),
+        ),
+        h('button', {
+          onClick: () => setHistOpen(!histOpen),
+          className: 'w-full flex items-center gap-2 px-5 text-[15px] font-bold text-text cursor-pointer hover:bg-bg-elevated/40',
+          style: { height: '56px' },   // match the right-panel action bar height
+        },
+          h(histOpen ? ChevronDown : ChevronRight, { size: 16, className: 'text-muted' }),
+          h(HistoryIcon, { size: 15, className: 'text-muted' }), 'History',
+          h('span', { className: 'text-[12px] text-muted font-normal' }, `(${history.length})`),
+        ),
+        ),
+      ),
     ),
 
     // drag handle = the gap between panels

@@ -1,106 +1,168 @@
 ---
 name: visual-edit
-description: Interpret and act on visual_edit_request payloads produced by the Select-to-Edit app. Use when the user references a visual selection, a "select to edit" request, or asks you to apply a pending visual edit.
+description: Interpret and act on batched visual edit requests produced by the Design Tweak app. Use when the user references a visual selection, a "design tweak" request, an edit request number, or asks you to apply pending visual edits.
 always: false
 ---
 
-# Visual Edit — Select-to-Edit request handling
+# Visual Edit — Design Tweak request handling
 
-The **Poke & Prose** app lets a designer/front-end engineer visually pick
-element(s) in a live preview and attach a natural-language comment. Each capture
-is written as a structured `visual_edit_request` JSON file to this app's queue:
+The **Design Tweak** app lets a designer visually pick element(s) in a live
+preview and attach natural-language comments. Comments accumulate into a
+**request**, and the designer sends the whole batch at once. One request file
+therefore contains **many comments as sub-items**:
 
 ```
-~/.kiroclaw/apps/poke-and-prose/data/queue/<timestamp>-<id>.json
+~/.kirocrew/apps/poke-and-prose/data/queue/<timestamp>-<id>.json
 ```
 
-When the user says things like "apply the pending visual edit", "do the select-to-edit
-request", or references a selection they just made, do this:
+**A request is a batch. Work every comment in it, and report per comment.**
 
-1. **Read the newest file** in the queue directory (highest timestamp). If the user
-   named a specific id, use that file. List the dir to find it.
-2. **Parse the payload** (schema below). The user's intent is in `comment`.
-3. **Resolve the target source.** The payload now includes project context stamped
-   by the app backend — prefer it over searching:
-   - `projectRoot` — absolute path to the previewed web app's root folder.
-   - `sourceFile` — absolute path to the specific file being previewed (e.g. the
-     served `index.html`). Open this file first; the selected element is in it.
-   Then, within that file, use each element's `source` block by confidence:
-   - `confidence: "high"` — `file:line:col` from the build-time plugin. Trust it.
-   - `confidence: "medium"` — framework internal (React Fiber). Verify against `htmlSnippet`.
-   - `confidence: "low"` — no source map (plain HTML). Locate the node inside `sourceFile`
-     by its `htmlSnippet`, `classes`, `id`, or text — you already know the file, so this
-     is a search **within one file**, never across the tree.
-   If `projectRoot` is empty, a dev-server URL (`devServer`) was used instead; fall back
-   to the active project directory + `htmlSnippet`.
-4. **Make the edit** the comment asks for, scoped to the selected element(s). Do not
-   refactor surrounding code. For `mode: "multi"`, apply the comment to every element
-   in `elements` (they were selected as a set — e.g. "increase spacing between these
-   cards" applies to the shared container/gap).
-5. **Stream progress back to the in-preview pin.** As you work, POST short notes to
-   the request thread so they appear in the Figma-style comment popover anchored to
-   the element:
+## The loop
 
-   ```
-   POST /apps/poke-and-prose/api/thread?id=<id>
-   body: {"role": "agent", "text": "Editing styles.css — uppercasing .section-title"}
-   ```
+1. **Read the request file.** The prompt names the request id; if not, read the
+   newest file in the queue dir. `state` will be `"sent"` — a `"draft"` request
+   has not been handed to you yet, so leave drafts alone.
+2. **Work `comments[]` in order.** Each entry is an independent edit with its own
+   `cid`, `comment`, `sourceFile`, and `selection`. Do not merge them into one
+   change, even when two comments touch the same file.
+3. **For each comment**, resolve the target, make the edit, and report against
+   **that comment's `cid`** (see below).
+4. When every comment is done, tell the user what changed, grouped by comment
+   number.
 
-   Keep each note to one short line. Post one when you start, and one per meaningful
-   step. When finished, post a final note **with a status** so the pin turns green:
+## Reporting progress — always per comment
 
-   ```
-   POST /apps/poke-and-prose/api/thread?id=<id>
-   body: {"role": "agent", "text": "Done — added text-transform: uppercase", "status": "done"}
-   ```
+Each comment has its own progress bubble in the preview, so notes must be
+addressed to a `cid`:
 
-   Setting `"status": "done"` marks the request complete (pin turns green) while
-   keeping the thread visible. Do NOT clear the request unless the user asks to
-   dismiss it — clearing removes the pin. (Use `POST /clear?id=<id>` only to dismiss.)
-6. Tell the user what you changed and in which file.
+```
+POST /apps/poke-and-prose/api/thread?id=<requestId>&cid=<commentId>
+body: {"role": "agent", "text": "Editing styles.css — uppercasing .section-title"}
+```
 
-## Payload schema
+Post one note when you start a comment, and one per meaningful step. Keep each to
+a single short line. When that comment is finished, post a final note carrying a
+status so its dot turns green:
+
+```
+POST /apps/poke-and-prose/api/thread?id=<requestId>&cid=<commentId>
+body: {"role": "agent", "text": "Done — added text-transform: uppercase", "status": "done"}
+```
+
+The request's own status is **derived**: it flips to `done` on its own once every
+comment is `done`. Never set it directly.
+
+> **Never write to the request file yourself.** Do not edit `state`, `status`,
+> `sentAt`, or any other field by writing the JSON — the panel derives the
+> request's badge from its comments, and a hand-written `state` desynchronises
+> them. Progress is reported *only* through `POST /thread`. The file is the
+> app's state, not a scratchpad.
+
+- Omitting `&cid=` posts a request-level note. Use that only for something that
+  spans the whole batch ("rebuilding, one moment").
+- A request-level `{"status": "done"}` marks *every* comment done. It is a
+  fallback, not the normal path — prefer per-comment reporting so the designer
+  can see which specific edits landed.
+- Do **not** clear a request unless the user asks to dismiss it — clearing
+  removes the pins. (`POST /clear?id=<requestId>` archives it to History.)
+
+## Resolving each comment's target source
+
+Every comment carries its own project context stamped by the backend — prefer it
+over searching, and note that comments in one batch can point at **different
+files** (the designer may have navigated between pages mid-batch).
+
+- `projectRoot` (request level) — absolute path to the previewed app's root.
+- `sourceFile` (per comment) — absolute path to the file that was being previewed
+  when that comment was made. Open this first; the element is in it.
+
+Then, within that file, use the element's `source` block by confidence:
+
+- `confidence: "high"` — `file:line:col` from the build-time plugin. Trust it.
+- `confidence: "medium"` — framework internal (React Fiber). Verify against `htmlSnippet`.
+- `confidence: "low"` — no source map (plain HTML). Locate the node inside
+  `sourceFile` by its `htmlSnippet`, `classes`, `id`, or text. You already know
+  the file, so this is a search **within one file**, never across the tree.
+
+If `projectRoot` is empty, a dev-server URL (`devServer`) was used instead; fall
+back to the active project directory + `htmlSnippet`.
+
+## Follow-up comments
+
+A comment with a non-empty `followUpTo` refines an **earlier** comment, whose
+`cid` it names. That original comment usually lives in a *different, already-sent*
+request — look for it in the queue dir, then in `../handled/`.
+
+Read the origin comment and its `thread` before editing: the follow-up is
+phrased as a delta ("actually make it 32px"), so it only makes sense against what
+was already done. Report the follow-up against its **own** `cid`, not the
+original's — the original request is finished and must not be mutated.
+
+## Request schema
 
 ```json
 {
-  "type": "visual_edit_request",
+  "type": "visual_edit_batch",
   "id": "1720560000000-a1b2c3",
-  "createdAt": "2026-07-09T23:00:00Z",
-  "selection": {
-    "mode": "single | multi",
-    "elements": [
-      {
-        "tag": "div",
-        "id": "",
-        "classes": ["card", "card--pricing"],
-        "locator": "main > section:nth-of-type(2) > div:nth-of-type(3)",
-        "boundingRect": { "x": 120, "y": 340, "width": 280, "height": 180 },
-        "source": {
-          "file": "src/components/PricingCard.tsx",
-          "line": 42,
-          "column": 6,
-          "confidence": "high | medium | low"
-        },
-        "htmlSnippet": "<div class=\"card card--pricing\">…</div>",
-        "relevantStyles": { "display": "flex", "gap": "12px", "position": "relative" }
-      }
-    ]
-  },
-  "comment": "increase spacing between these cards",
-  "previewUrl": "http://localhost:5173/pricing",
-  "thread": [
-    { "role": "user", "text": "increase spacing between these cards", "ts": "2026-07-13T18:00:00Z" }
+  "number": 3,
+  "state": "draft | sent",
+  "projectId": "e4b4aa4c",
+  "projectRoot": "/Users/me/Developer/my-site",
+  "createdAt": "2026-07-29T23:00:00Z",
+  "sentAt": "2026-07-29T23:04:00Z",
+  "thread": [],
+  "comments": [
+    {
+      "cid": "1720560000111-d4e5f6",
+      "index": 1,
+      "status": "new | sent | done",
+      "comment": "increase spacing between these cards",
+      "createdAt": "2026-07-29T23:00:00Z",
+      "sourceFile": "/Users/me/Developer/my-site/pricing.html",
+      "previewUrl": "http://…/api/proxy/e4b4aa4c/pricing.html",
+      "followUpTo": "",
+      "selection": {
+        "mode": "single | multi",
+        "elements": [
+          {
+            "tag": "div",
+            "id": "",
+            "classes": ["card", "card--pricing"],
+            "locator": "main > section:nth-of-type(2) > div:nth-of-type(3)",
+            "boundingRect": { "x": 120, "y": 340, "width": 280, "height": 180 },
+            "source": {
+              "file": "src/components/PricingCard.tsx",
+              "line": 42,
+              "column": 6,
+              "confidence": "high | medium | low"
+            },
+            "htmlSnippet": "<div class=\"card card--pricing\">…</div>",
+            "relevantStyles": { "display": "flex", "gap": "12px" }
+          }
+        ]
+      },
+      "thread": [
+        { "role": "user", "text": "increase spacing between these cards", "ts": "2026-07-29T23:00:00Z" }
+      ]
+    }
   ]
 }
 ```
 
+Comment numbering shown to the designer is `<request number>.<index>` — comment
+`index: 1` of request `number: 3` is **3.1**. Use that form when talking to them.
+
 ## Editing guidance
 
-- The `file` path in `source` is **relative to the dev server project root**, not the
-  KiroClaw workspace. Combine it with the user's active project directory to open it.
+- Scope each edit to the selected element(s). Do not refactor surrounding code.
+- For `mode: "multi"`, apply that comment to every element in `elements` — they
+  were selected as a set (e.g. "increase spacing between these cards" applies to
+  the shared container or gap).
+- The `file` path inside `source` is relative to the **project root**, not the
+  KiroCrew workspace. Combine it with `projectRoot`.
 - Prefer editing the exact `line:col`; use `htmlSnippet`, `classes`, and `id` to
-  disambiguate when a component is rendered in a `.map()` loop (same source line,
+  disambiguate when a component renders in a `.map()` loop (same source line,
   many instances).
-- Never guess a file when confidence is `low` — search first, then confirm.
-- Keep edits minimal and reversible; the dev server hot-reloads, so the user sees
-  the result immediately.
+- Never guess a file when confidence is `low` — locate it first, then confirm.
+- Keep edits minimal and reversible. The panel reloads the preview automatically
+  each time a comment flips to `done`, so the designer sees results as you go.

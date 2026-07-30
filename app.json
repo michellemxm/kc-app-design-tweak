@@ -1,8 +1,8 @@
 {
   "name": "poke-and-prose",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "repository": "https://github.com/michellemxm/poke-and-prose",
-  "displayName": "Poke & Prose",
+  "displayName": "Design Tweak",
   "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent — like Figma comments, but for code.",
   "author": "mxiaomen",
   "license": "MIT",
@@ -14,7 +14,7 @@
     "productivity"
   ],
   "defaultEnabled": false,
-  "minKiroClawVersion": "0.1.0",
+  "minKiroCrewVersion": "0.1.0",
   "skills": [
     "skills/visual-edit"
   ],
@@ -34,8 +34,8 @@
     "pages": [
       {
         "route": "/poke-and-prose",
-        "label": "Poke & Prose",
-        "icon": "MousePointerClick"
+        "label": "Design Tweak",
+        "icon": "Paintbrush"
       }
     ]
   },
