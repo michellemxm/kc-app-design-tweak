@@ -23,6 +23,7 @@ sanctioned "well-known file the agent watches" fallback.
 
 from __future__ import annotations
 
+import html as _html
 import json
 import os
 import re
@@ -37,7 +38,11 @@ import urllib.error
 
 VERSION = "0.6.0"
 PORT = int(os.environ.get("PORT", 9110))
-APP_NAME = os.environ.get("KIROCLAW_APP_NAME", "poke-and-prose")
+APP_NAME = (
+    os.environ.get("KIROCREW_APP_NAME")
+    or os.environ.get("KIROCLAW_APP_NAME")  # legacy host fallback
+    or "poke-and-prose"
+)
 
 # Public (browser-facing) proxy paths — resolved through the gateway proxy.
 PROXY_PUBLIC_BASE = f"/apps/{APP_NAME}/api/proxy/"
@@ -52,19 +57,25 @@ INJECT_FILE = (Path(__file__).resolve().parent.parent / "inject" / "select-to-ed
 _ROOT = ""
 _TARGET = ""
 
-# Resolve the app data dir. KiroClaw sets an env for it; fall back to the
-# documented default location under ~/.kiroclaw/apps/<name>/data.
+# Resolve the app data dir. The host does not inject a data-dir env, so we
+# fall back to the platform-standard location under ~/.kirocrew/apps/<name>/data
+# (KIROCREW_HOME points at ~/.kirocrew). Legacy env names / ~/.kiroclaw are kept
+# as a last resort so the app still works on the older host.
 _DATA_ENV = (
-    os.environ.get("KIROCLAW_APP_DATA_DIR")
+    os.environ.get("KIROCREW_APP_DATA_DIR")
+    or os.environ.get("KIROCREW_APP_DATA")
+    or os.environ.get("KIROCLAW_APP_DATA_DIR")
     or os.environ.get("KIROCLAW_APP_DATA")
     or ""
 )
 if _DATA_ENV:
     DATA_DIR = Path(_DATA_ENV).expanduser().resolve()
 else:
-    DATA_DIR = (
-        Path(os.path.expanduser("~")) / ".kiroclaw" / "apps" / APP_NAME / "data"
-    ).resolve()
+    _home = os.environ.get("KIROCREW_HOME")
+    _base = Path(_home).expanduser() if _home else (Path(os.path.expanduser("~")) / ".kirocrew")
+    if not _home and not _base.exists() and (Path(os.path.expanduser("~")) / ".kiroclaw").exists():
+        _base = Path(os.path.expanduser("~")) / ".kiroclaw"  # legacy host
+    DATA_DIR = (_base / "apps" / APP_NAME / "data").resolve()
 
 QUEUE_DIR = DATA_DIR / "queue"
 HANDLED_DIR = DATA_DIR / "handled"
@@ -137,29 +148,149 @@ def _pending_files() -> list[Path]:
     return sorted(QUEUE_DIR.glob("*.json"))
 
 
-def _summarize(payload: dict) -> dict:
-    sel = payload.get("selection") or {}
+def _el_name(el: dict) -> str:
+    """Human-readable element label, e.g. 'nav#site-header' or 'div.card.grid'."""
+    name = el.get("tag", "")
+    if el.get("id"):
+        name += f"#{el['id']}"
+    elif el.get("classes"):
+        name += "." + ".".join(el["classes"][:2])
+    return name
+
+
+# ---------------------------------------------------------------------------
+# Request / comment model.
+#
+# A queue file is ONE REQUEST that contains MANY COMMENTS as sub-items:
+#
+#   { type, id, number, state: "draft"|"sent", projectId, projectRoot,
+#     createdAt, sentAt, thread: [...],                     # request-level notes
+#     comments: [ { cid, index, status, comment, createdAt,
+#                   selection, previewUrl, sourceFile,
+#                   followUpTo, thread: [...] } ] }
+#
+# Lifecycle (seal-on-send): comments land in the project's single OPEN DRAFT.
+# Sending seals that draft (state -> "sent") and it never accepts comments
+# again, so the next comment always opens a fresh draft — even while the
+# previous batch is still being worked.
+# ---------------------------------------------------------------------------
+_COMMENT_STATUSES = ("new", "sent", "done")
+
+
+def _request_status(req: dict) -> str:
+    """Roll a request's comment statuses up into one request-level status.
+
+    Comment statuses are AUTHORITATIVE; `state` is only a hint about whether the
+    batch was formally sealed. This asymmetry matters: an agent that writes an
+    unexpected `state` (or an old file with none) must never make a request that
+    is plainly in flight read as an unsent draft. So "draft" is returned only
+    when nothing has happened yet — explicit draft state AND every comment new.
+    """
+    comments = req.get("comments") or []
+    if not comments:
+        return "draft"
+    if all(c.get("status") == "done" for c in comments):
+        return "done"
+    if req.get("state") != "draft" or any(c.get("status") != "new" for c in comments):
+        return "sent"
+    return "draft"
+
+
+def _is_draft(req: dict) -> bool:
+    """True only for a request that is still open for new comments."""
+    return _request_status(req) == "draft"
+
+
+
+def _summarize_comment(c: dict) -> dict:
+    sel = c.get("selection") or {}
     elements = sel.get("elements") or []
     el = elements[0] if elements else {}
-    el_name = el.get("tag", "")
-    if el.get("id"):
-        el_name += f"#{el['id']}"
-    elif el.get("classes"):
-        el_name += "." + ".".join(el["classes"][:2])
     return {
-        "id": payload.get("id", ""),
-        "number": payload.get("number", 0),
-        "status": payload.get("status", "new"),
-        "createdAt": payload.get("createdAt", ""),
-        "comment": payload.get("comment", ""),
-        "mode": sel.get("mode", "single"),
-        "count": len(elements),
-        "element": el_name,
+        "cid": c.get("cid", ""),
+        "index": c.get("index", 0),
+        "status": c.get("status", "new"),
+        "comment": c.get("comment", ""),
+        "createdAt": c.get("createdAt", ""),
+        "element": _el_name(el),
         "locator": el.get("locator", ""),
-        "thread": payload.get("thread", []),
-        "previewUrl": payload.get("previewUrl", ""),
-        "projectRoot": payload.get("projectRoot", ""),
+        "count": len(elements),
+        "mode": sel.get("mode", "single"),
+        "previewUrl": c.get("previewUrl", ""),
+        "sourceFile": c.get("sourceFile", ""),
+        "followUpTo": c.get("followUpTo", ""),
+        "thread": c.get("thread") or [],
     }
+
+
+def _summarize(req: dict) -> dict:
+    """Panel-facing shape of a request: metadata + its comments as sub-items."""
+    comments = req.get("comments") or []
+    return {
+        "id": req.get("id", ""),
+        "number": req.get("number", 0),
+        "state": req.get("state", "draft"),
+        "status": _request_status(req),
+        "createdAt": req.get("createdAt", ""),
+        "sentAt": req.get("sentAt", ""),
+        "projectId": req.get("projectId", ""),
+        "projectRoot": req.get("projectRoot", ""),
+        "thread": req.get("thread") or [],
+        "doneCount": sum(1 for c in comments if c.get("status") == "done"),
+        "comments": [_summarize_comment(c) for c in comments],
+    }
+
+
+def _proj_for_preview(preview_url: str) -> tuple[dict | None, str]:
+    """Resolve (project, path-within-project) from a preview URL.
+
+    Preview URLs look like `/apps/<app>/api/proxy/<projectId>/<rel>`, so the
+    project id and the served file both fall out of the path.
+    """
+    marker = "/api/proxy/"
+    i = str(preview_url).find(marker)
+    if i == -1:
+        return None, ""
+    rel = str(preview_url)[i + len(marker):].split("?")[0].split("#")[0]
+    seg = rel.split("/", 1)[0] if rel else ""
+    rest = rel.split("/", 1)[1] if "/" in rel else ""
+    proj = next((p for p in _CFG["projects"] if p["id"] == seg), None)
+    return proj, rest
+
+
+def _read_request(fp: Path) -> dict | None:
+    try:
+        req = json.loads(fp.read_text("utf-8"))
+        return req if isinstance(req, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_request(fp: Path, req: dict) -> None:
+    fp.write_text(json.dumps(req, indent=2), encoding="utf-8")
+
+
+def _find_request(rid: str) -> Path | None:
+    """Locate a request file by id, queue/ first then handled/."""
+    for d in (QUEUE_DIR, HANDLED_DIR):
+        fp = d / f"{rid}.json"
+        if fp.is_file():
+            return fp
+    return None
+
+
+def _open_draft_file(project_id: str) -> Path | None:
+    """The project's single open draft, if one exists.
+
+    Uses the derived status, not raw `state`, so a request whose comments are
+    already being worked can never quietly collect new comments.
+    """
+    for fp in _pending_files():
+        req = _read_request(fp)
+        if req and req.get("projectId") == project_id and _is_draft(req):
+            return fp
+    return None
+
 
 
 def _valid_target(url: str) -> bool:
@@ -212,6 +343,69 @@ def _guess_ctype(p: Path) -> str:
         return _CTYPE_OVERRIDES[ext]
     mime, _ = mimetypes.guess_type(str(p))
     return mime or "application/octet-stream"
+
+
+# ---------------------------------------------------------------------------
+# Entry-point resolution.
+#
+# Not every project folder has index.html at its top level: a repo may keep the
+# static site in public/ or dist/, or nest the app in a subfolder (mono-repos).
+# Rather than 404 on the folder request, look for the most likely entry file,
+# and if there is none, render a page that lists the HTML files we DID find so
+# the user can pick one instead of staring at a dead iframe.
+# ---------------------------------------------------------------------------
+_ENTRY_CANDIDATES = (
+    "index.html", "index.htm",
+    "public/index.html", "dist/index.html", "build/index.html", "out/index.html",
+    "app/index.html", "src/index.html", "site/index.html", "www/index.html",
+    "docs/index.html", "demo/index.html", "example/index.html", "examples/index.html",
+)
+
+# Directories that never contain the previewable entry point but do contain
+# thousands of files — skipping them keeps the HTML scan fast.
+_SCAN_SKIP_DIRS = {
+    "node_modules", ".git", ".next", ".nuxt", ".svelte-kit", ".cache", ".turbo",
+    "__pycache__", ".venv", "venv", "coverage", "htmlcov", ".pytest_cache",
+    "target", "vendor", ".idea", ".vscode",
+}
+
+
+def _find_entry(folder: Path):
+    """Best-guess entry HTML inside `folder`. Returns a Path or None."""
+    for rel in _ENTRY_CANDIDATES:
+        p = folder / rel
+        if p.is_file():
+            return p
+    return None
+
+
+def _scan_html(root: Path, limit: int = 40, max_depth: int = 3) -> list[str]:
+    """Shallow scan for .html/.htm files, returned as root-relative POSIX paths."""
+    found: list[str] = []
+
+    def walk(d: Path, depth: int) -> None:
+        if len(found) >= limit or depth > max_depth:
+            return
+        try:
+            entries = sorted(d.iterdir(), key=lambda e: (e.is_dir(), e.name.lower()))
+        except OSError:
+            return
+        for e in entries:
+            if len(found) >= limit:
+                return
+            name = e.name
+            if e.is_dir():
+                if name.startswith(".") or name in _SCAN_SKIP_DIRS:
+                    continue
+                walk(e, depth + 1)
+            elif e.suffix.lower() in (".html", ".htm"):
+                try:
+                    found.append(e.relative_to(root).as_posix())
+                except ValueError:
+                    continue
+
+    walk(root, 0)
+    return found
 
 
 def _rewrite_html(body: bytes, base: str = PROXY_PUBLIC_BASE) -> bytes:
@@ -267,31 +461,35 @@ class Handler(BaseHTTPRequestHandler):
                     "dataDir": str(DATA_DIR),
                 })
             if route == "/queue":
+                # Requests, oldest first — each carries its comments as sub-items.
                 pending = []
                 for fp in _pending_files():
-                    try:
-                        pending.append(_summarize(json.loads(fp.read_text("utf-8"))))
-                    except (OSError, ValueError):
-                        continue
+                    req = _read_request(fp)
+                    if req is not None:
+                        pending.append(_summarize(req))
+                pending.sort(key=lambda r: r.get("number") or 0)
                 return self._json(200, {"pending": pending})
             if route == "/latest":
+                # The newest request, full payload — what the agent reads to work
+                # a batch it was just handed.
                 files = _pending_files()
                 if not files:
                     return self._json(200, {})
-                try:
-                    return self._json(200, json.loads(files[-1].read_text("utf-8")))
-                except (OSError, ValueError) as exc:
-                    return self._json(500, {"error": str(exc)})
+                newest, newest_num = None, -1
+                for fp in files:
+                    req = _read_request(fp)
+                    if req and (req.get("number") or 0) > newest_num:
+                        newest, newest_num = req, req.get("number") or 0
+                return self._json(200, newest or {})
             if route == "/projects":
                 return self._h_projects_list()
             if route == "/history":
-                pending = []
+                done = []
                 for fp in sorted(HANDLED_DIR.glob("*.json"), reverse=True)[:50]:
-                    try:
-                        pending.append(_summarize(json.loads(fp.read_text("utf-8"))))
-                    except (OSError, ValueError):
-                        continue
-                return self._json(200, {"history": pending})
+                    req = _read_request(fp)
+                    if req is not None:
+                        done.append(_summarize(req))
+                return self._json(200, {"history": done})
             if route == "/proxy-inject.js":
                 return self._h_inject()
             if route == "/proxy" or route.startswith("/proxy/"):
@@ -320,8 +518,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._h_projects_remove()
             if route == "/pick-folder":
                 return self._h_pick_folder()
-            if route == "/mark-sent":
-                return self._h_mark_sent(qs)
+            if route == "/send":
+                return self._h_send(qs)
+            if route == "/delete-comment":
+                return self._h_delete_comment(qs)
             if route == "/thread":
                 return self._h_thread(qs)
             if route == "/self-update":
@@ -344,6 +544,12 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def _h_submit(self) -> None:
+        """Append a captured comment to the project's OPEN DRAFT request.
+
+        Creates the draft if there isn't one. Never dispatches — sending is an
+        explicit, separate step (POST /send) so a batch of comments goes to the
+        agent as a single request.
+        """
         payload = self._read_body()
         if payload.get("type") != "visual_edit_request":
             return self._json(400, {"error": "type must be 'visual_edit_request'"})
@@ -351,47 +557,149 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(sel, dict) or not sel.get("elements"):
             return self._json(400, {"error": "selection.elements is required"})
 
-        rid = payload.get("id") or _new_id()
-        if not _ID_RE.match(str(rid)):
-            rid = _new_id()
-        payload["id"] = rid
-        payload.setdefault("createdAt", _now_iso())
-        payload["number"] = _next_number()
-        payload.setdefault("status", "new")
+        preview_url = str(payload.get("previewUrl", ""))
+        proj, rest = _proj_for_preview(preview_url)
+        project_id = proj["id"] if proj else ""
 
-        # Seed the per-request thread with the user's comment as the first entry.
-        # The agent appends progress/results via POST /thread; the in-page overlay
-        # polls and renders this as a Figma-style comment thread on the element.
-        if not isinstance(payload.get("thread"), list) or not payload["thread"]:
-            payload["thread"] = [{
-                "role": "user",
-                "text": payload.get("comment", ""),
-                "ts": payload["createdAt"],
-            }]
-
-        # Stamp project context so the agent doesn't have to search for the source.
-        pu = str(payload.get("previewUrl", ""))
-        marker = "/api/proxy/"
-        i = pu.find(marker)
-        rel = pu[i + len(marker):].split("?")[0].split("#")[0] if i != -1 else ""
-        seg = rel.split("/", 1)[0] if rel else ""
-        proj = next((p for p in _CFG["projects"] if p["id"] == seg), None)
+        # Resolve the source file for THIS comment (per-comment, because a batch
+        # can span several pages of the same app).
         if proj is not None:
-            rest = rel.split("/", 1)[1] if "/" in rel else ""
-            payload["projectRoot"] = proj["path"]
-            payload["sourceFile"] = str(Path(proj["path"]) / (rest or "index.html"))
+            project_root = proj["path"]
+            source_file = str(Path(project_root) / (rest or "index.html"))
         elif _ROOT:
-            payload["projectRoot"] = _ROOT
-            payload["sourceFile"] = str(Path(_ROOT) / (rel or "index.html"))
-        elif _TARGET:
-            payload["projectRoot"] = ""
-            payload["devServer"] = _TARGET
+            project_root = _ROOT
+            source_file = str(Path(_ROOT) / (rest or "index.html"))
+        else:
+            project_root = ""
+            source_file = ""
 
-        out = QUEUE_DIR / f"{rid}.json"
-        out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Find or open the draft for this project.
+        fp = _open_draft_file(project_id)
+        if fp is None:
+            rid = _new_id()
+            req = {
+                "type": "visual_edit_batch",
+                "id": rid,
+                "number": _next_number(),
+                "state": "draft",
+                "projectId": project_id,
+                "projectRoot": project_root,
+                "createdAt": _now_iso(),
+                "sentAt": "",
+                "thread": [],
+                "comments": [],
+            }
+            fp = QUEUE_DIR / f"{rid}.json"
+        else:
+            req = _read_request(fp)
+            if req is None:
+                return self._json(500, {"error": "draft request unreadable"})
+
+        comments = req.setdefault("comments", [])
+        cid = payload.get("cid") or _new_id()
+        if not _ID_RE.match(str(cid)):
+            cid = _new_id()
+        created = payload.get("createdAt") or _now_iso()
+
+        # A follow-up references an earlier comment (possibly in an already-sent
+        # request); it still ships in THIS batch, just linked to its origin.
+        follow_up_to = str(payload.get("followUpTo", "") or "")
+        if follow_up_to and not _ID_RE.match(follow_up_to):
+            follow_up_to = ""
+
+        comment = {
+            "cid": cid,
+            "index": len(comments) + 1,
+            "status": "new",
+            "comment": str(payload.get("comment", "")),
+            "createdAt": created,
+            "selection": sel,
+            "previewUrl": preview_url,
+            "sourceFile": source_file,
+            "followUpTo": follow_up_to,
+            # The user's own comment seeds the thread so the in-preview bubble
+            # reads as a conversation from the first frame.
+            "thread": [{"role": "user", "text": str(payload.get("comment", "")), "ts": created}],
+        }
+        if _TARGET and not project_root:
+            comment["devServer"] = _TARGET
+        comments.append(comment)
+        _write_request(fp, req)
+
         return self._json(200, {
-            "ok": True, "id": rid, "number": payload["number"], "savedTo": str(out),
+            "ok": True,
+            "id": req["id"],
+            "number": req["number"],
+            "state": req["state"],
+            "cid": cid,
+            "index": comment["index"],
+            "label": f"{req['number']}.{comment['index']}",
+            "commentCount": len(comments),
+            "savedTo": str(fp),
         })
+
+    def _h_send(self, qs: dict) -> None:
+        """Seal a draft request and mark every comment as sent (seal-on-send).
+
+        After this the request never accepts new comments, so the next captured
+        comment opens a fresh draft even while this batch is still in flight.
+        """
+        rid = (qs.get("id") or [""])[0]
+        if not rid or not _ID_RE.match(rid):
+            return self._json(400, {"error": "valid id required"})
+        fp = QUEUE_DIR / f"{rid}.json"
+        if not fp.is_file():
+            return self._json(404, {"error": "not found"})
+        req = _read_request(fp)
+        if req is None:
+            return self._json(500, {"error": "request unreadable"})
+        comments = req.get("comments") or []
+        if not comments:
+            return self._json(400, {"error": "request has no comments"})
+        if not _is_draft(req):
+            return self._json(200, {"ok": True, "already": True, "request": _summarize(req)})
+        req["state"] = "sent"
+        req["sentAt"] = _now_iso()
+        for c in comments:
+            if c.get("status") == "new":
+                c["status"] = "sent"
+        _write_request(fp, req)
+        return self._json(200, {"ok": True, "request": _summarize(req)})
+
+    def _h_delete_comment(self, qs: dict) -> None:
+        """Drop a single comment from a DRAFT request (undo a mis-click).
+
+        Refused once the request is sent — the agent already has that batch.
+        """
+        rid = (qs.get("id") or [""])[0]
+        cid = (qs.get("cid") or [""])[0]
+        if not rid or not _ID_RE.match(rid) or not cid or not _ID_RE.match(cid):
+            return self._json(400, {"error": "valid id and cid required"})
+        fp = QUEUE_DIR / f"{rid}.json"
+        if not fp.is_file():
+            return self._json(404, {"error": "not found"})
+        req = _read_request(fp)
+        if req is None:
+            return self._json(500, {"error": "request unreadable"})
+        if not _is_draft(req):
+            return self._json(409, {"error": "request already sent — cannot remove comments"})
+        comments = req.get("comments") or []
+        kept = [c for c in comments if c.get("cid") != cid]
+        if len(kept) == len(comments):
+            return self._json(404, {"error": "comment not found"})
+        for n, c in enumerate(kept, start=1):
+            c["index"] = n          # keep sub-numbering contiguous (3.1, 3.2, …)
+        req["comments"] = kept
+        # An emptied draft is noise in the rail — drop the request with it.
+        if not kept:
+            try:
+                fp.unlink()
+            except OSError as exc:
+                return self._json(500, {"error": str(exc)})
+            return self._json(200, {"ok": True, "id": rid, "removedRequest": True})
+        _write_request(fp, req)
+        return self._json(200, {"ok": True, "id": rid, "cid": cid, "request": _summarize(req)})
+
 
     def _h_clear(self, qs: dict) -> None:
         rid = (qs.get("id") or [""])[0]
@@ -497,7 +805,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             script = (
                 'tell application "System Events" to activate\n'
-                'POSIX path of (choose folder with prompt "Select a web app folder for Poke & Prose")'
+                'POSIX path of (choose folder with prompt "Select a web app folder for Design Tweak")'
             )
             r = subprocess.run(
                 ["osascript", "-e", script],
@@ -519,31 +827,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": False, "canceled": True})
         return self._json(200, {"ok": True, "path": path})
 
-    def _h_mark_sent(self, qs: dict) -> None:
-        rid = (qs.get("id") or [""])[0]
-        if not rid or not _ID_RE.match(rid):
-            return self._json(400, {"error": "valid id required"})
-        fp = QUEUE_DIR / f"{rid}.json"
-        if not fp.exists():
-            return self._json(404, {"error": "not found"})
-        try:
-            payload = json.loads(fp.read_text("utf-8"))
-            payload["status"] = "sent"
-            fp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except (OSError, ValueError) as exc:
-            return self._json(500, {"error": str(exc)})
-        return self._json(200, {"ok": True, "id": rid, "status": "sent"})
-
     def _h_thread(self, qs: dict) -> None:
-        """Append a message to a request's thread and optionally update its status.
+        """Append a progress note to a COMMENT's thread (or the request's).
+
+        `POST /thread?id=<requestId>&cid=<commentId>` targets one comment — this
+        is what the agent uses while working a batch, so each comment's bubble
+        tracks its own progress. Omitting `cid` appends a request-level note.
 
         Body: {"role": "agent"|"user"|"system", "text": "...", "status": "done"?}
-        The agent calls this while working a request so the in-page overlay shows
-        progress like a Figma comment thread. Looks in queue/ first, then handled/.
+        `status` applies to the addressed comment. The request's own status is
+        always derived from its comments, never stored.
         """
         rid = (qs.get("id") or [""])[0]
+        cid = (qs.get("cid") or [""])[0]
         if not rid or not _ID_RE.match(rid):
             return self._json(400, {"error": "valid id required"})
+        if cid and not _ID_RE.match(cid):
+            return self._json(400, {"error": "invalid cid"})
         data = self._read_body()
         text = str(data.get("text", "")).strip()
         role = str(data.get("role", "agent")).strip() or "agent"
@@ -553,27 +853,62 @@ class Handler(BaseHTTPRequestHandler):
         if not text and not new_status:
             return self._json(400, {"error": "text or status required"})
 
-        fp = QUEUE_DIR / f"{rid}.json"
-        if not fp.exists():
-            fp = HANDLED_DIR / f"{rid}.json"
-        if not fp.exists():
+        fp = _find_request(rid)
+        if fp is None:
             return self._json(404, {"error": "not found"})
-        try:
-            payload = json.loads(fp.read_text("utf-8"))
-            thread = payload.get("thread")
+        req = _read_request(fp)
+        if req is None:
+            return self._json(500, {"error": "request unreadable"})
+
+        entry = {"role": role, "text": text, "ts": _now_iso()}
+        if cid:
+            target = next((c for c in (req.get("comments") or []) if c.get("cid") == cid), None)
+            if target is None:
+                return self._json(404, {"error": f"comment {cid} not in request {rid}"})
+            thread = target.get("thread")
             if not isinstance(thread, list):
                 thread = []
             if text:
-                thread.append({"role": role, "text": text, "ts": _now_iso()})
-            payload["thread"] = thread
-            if new_status in ("new", "sent", "done"):
-                payload["status"] = new_status
-            fp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except (OSError, ValueError) as exc:
+                thread.append(entry)
+            target["thread"] = thread
+            if new_status in _COMMENT_STATUSES:
+                target["status"] = new_status
+        else:
+            thread = req.get("thread")
+            if not isinstance(thread, list):
+                thread = []
+            if text:
+                thread.append(entry)
+            req["thread"] = thread
+            # A request-level `done` fans out to every comment, so an agent that
+            # reports once for the whole batch still resolves the sub-items.
+            if new_status == "done":
+                for c in req.get("comments") or []:
+                    c["status"] = "done"
+
+        # Any agent activity means this batch is in flight — normalise `state` so
+        # it can never contradict the comments. Two drifts to close: an agent
+        # writing its own `state` value (which used to make a worked request read
+        # back as an unsent draft), and an agent reporting progress on a request
+        # that was never formally sealed. A bare progress note is enough evidence:
+        # the agent only ever sees a request that was handed to it.
+        agent_activity = role in ("agent", "system")
+        worked = any(c.get("status") != "new" for c in (req.get("comments") or []))
+        if req.get("state") not in ("draft", "sent") or (
+            req.get("state") == "draft" and (worked or agent_activity)
+        ):
+            req["state"] = "sent"
+            if not req.get("sentAt"):
+                req["sentAt"] = _now_iso()
+
+        try:
+            _write_request(fp, req)
+        except OSError as exc:
             return self._json(500, {"error": str(exc)})
         return self._json(200, {
-            "ok": True, "id": rid, "status": payload.get("status"),
-            "count": len(payload["thread"]),
+            "ok": True, "id": rid, "cid": cid,
+            "status": _request_status(req),
+            "request": _summarize(req),
         })
 
     def _h_self_update(self) -> None:
@@ -683,7 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_raw(
             503, "text/html; charset=utf-8",
             b"<h3 style='font:14px system-ui;padding:24px'>No project selected. "
-            b"Pick a web app in the Poke & Prose panel.</h3>",
+            b"Pick a web app in the Design Tweak panel.</h3>",
         )
 
     def _h_serve_root(self, sub: str, root_str: str, base: str) -> None:
@@ -696,21 +1031,95 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._send_raw(403, "text/plain", b"forbidden")
         if target.is_dir():
-            target = target / "index.html"
+            entry = _find_entry(target)
+            if entry is None:
+                return self._h_no_entry(root, target, base)
+            target = entry
         if not target.is_file():
-            return self._send_raw(
-                404, "text/html; charset=utf-8",
-                b"<h3 style='font:14px system-ui;padding:24px'>Not found in project folder.</h3>",
-            )
+            return self._h_no_entry(root, target, base, missing=rel)
         try:
             data = target.read_bytes()
         except OSError as exc:
             return self._send_raw(500, "text/plain", str(exc).encode())
         ctype = _guess_ctype(target)
         if "text/html" in ctype:
-            data = _rewrite_html(data, base)
+            # <base> must point at the SERVED FILE's own directory, not the
+            # project root — otherwise an index.html living in public/ or app/
+            # resolves its relative assets one level too high and renders blank.
+            try:
+                sub_dir = target.parent.relative_to(root).as_posix()
+            except ValueError:
+                sub_dir = "."
+            html_base = base if sub_dir in ("", ".") else base + sub_dir + "/"
+            data = _rewrite_html(data, html_base)
             ctype = "text/html; charset=utf-8"
         return self._send_raw(200, ctype, data)
+
+    def _h_no_entry(self, root: Path, folder: Path, base: str, missing: str = "") -> None:
+        """404 page that explains WHY nothing rendered and offers what we found.
+
+        Replaces a bare "Not found in project folder." — the common cause is a
+        project with no top-level index.html (site lives in public/ or dist/, or
+        the app is nested in a subfolder, or it isn't a static site at all)."""
+        scan_from = folder if folder.is_dir() else root
+        candidates = _scan_html(scan_from)
+        if not candidates and scan_from != root:
+            # An empty subfolder tells the user nothing — widen to the project root
+            # so the suggestions are actually actionable.
+            scan_from = root
+            candidates = _scan_html(scan_from)
+        try:
+            prefix = scan_from.relative_to(root).as_posix()
+        except ValueError:
+            prefix = ""
+        prefix = "" if prefix in ("", ".") else prefix + "/"
+
+        if missing:
+            head = f"<code>{_html.escape(missing)}</code> was not found in this project."
+        else:
+            head = f"No <code>index.html</code> in <code>{_html.escape(str(scan_from))}</code>."
+
+        if candidates:
+            links = "".join(
+                f'<li><a href="{_html.escape(base + prefix + c)}">{_html.escape(prefix + c)}</a></li>'
+                for c in candidates
+            )
+            body = (
+                "<p>Design Tweak serves the folder as a static site and looks for an "
+                "entry <code>index.html</code>. These HTML files are in the project — "
+                "click one to preview it:</p>"
+                f"<ul>{links}</ul>"
+                "<p class='hint'>If the right entry point isn't listed, register the "
+                "<em>subfolder</em> that contains it (<code>+ load new app</code>), or point "
+                "Design Tweak at a running dev server URL for framework projects.</p>"
+            )
+        else:
+            body = (
+                "<p>No HTML files were found here, so there is nothing to serve "
+                "statically. This usually means the project is a framework app "
+                "(React / Vite / Next) that needs its dev server, or the previewable "
+                "site lives in a subfolder that wasn't registered.</p>"
+                "<p class='hint'>Fix it by either registering the subfolder that "
+                "contains <code>index.html</code>, running the project's build "
+                "(<code>npm run build</code>) and registering <code>dist/</code>, or "
+                "starting <code>npm run dev</code> and pointing Design Tweak at "
+                "<code>http://localhost:PORT</code>.</p>"
+            )
+
+        page = (
+            "<!doctype html><meta charset='utf-8'>"
+            "<style>"
+            "body{font:14px/1.6 system-ui,-apple-system,sans-serif;padding:28px 32px;"
+            "color:#e6e6e6;background:#151517}"
+            "h3{margin:0 0 12px;font-size:15px;font-weight:600}"
+            "code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;"
+            "background:#26262a;padding:1px 5px;border-radius:4px}"
+            "ul{margin:12px 0;padding-left:20px}li{margin:3px 0}"
+            "a{color:#7cc4ff}.hint{color:#9a9aa2;font-size:13px}"
+            "</style>"
+            f"<h3>{head}</h3>{body}"
+        )
+        return self._send_raw(404, "text/html; charset=utf-8", page.encode("utf-8"))
 
     def _h_proxy_upstream(self, sub: str) -> None:
         """Reverse-proxy a localhost dev server (Vite/HMR projects)."""

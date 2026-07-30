@@ -8,3 +8,7 @@ installed.json
 __pycache__/
 node_modules/
 *.log
+*.bak
+
+# local editor / CLI config — not part of the app
+.kiro/

@@ -6,7 +6,7 @@
  * request, and the agent's progress streams back into a thread popover anchored
  * to the element.
  *
- * Delivery model (embedded in the Poke & Prose preview iframe):
+ * Delivery model (embedded in the Design Tweak preview iframe):
  *   - The overlay NEVER calls the backend directly (the gateway API requires an
  *     auth token only the panel's SDK has). Instead it talks to the parent panel
  *     over postMessage; the panel owns all backend reads/writes.
@@ -189,7 +189,7 @@
     css(row, { display: "flex", gap: "6px", justifyContent: "flex-end", marginTop: "8px" });
     var cancel = mkBtn("Cancel", "transparent", THEME.muted, function () { clearSelection(); });
     cancel.style.border = "1px solid " + THEME.border;
-    var send = mkBtn("Comment & send →", THEME.accent, THEME.accentFg, function () { submit(el, ta.value); });
+    var send = mkBtn("Add comment", THEME.accent, THEME.accentFg, function () { submit(el, ta.value); });
     row.appendChild(cancel);
     row.appendChild(send);
 
@@ -243,7 +243,7 @@
   function showComposerSending() {
     if (!input) return;
     input.innerHTML = "";
-    var m = mkMeta("Sending to agent…");
+    var m = mkMeta("Adding to request…");
     m.style.opacity = "0.9";
     input.appendChild(m);
   }
@@ -440,7 +440,9 @@
     ta.value = prevText;
     var row = document.createElement("div");
     css(row, { display: "flex", gap: "6px", justifyContent: "flex-end", marginTop: "6px" });
-    var send = mkBtn(item.status === "done" ? "Reopen & send →" : "Send →", THEME.accent, THEME.accentFg, function () {
+    // A reply on an existing comment becomes a NEW comment in the CURRENT draft,
+    // linked back to this one via followUpTo — the sent request is never mutated.
+    var send = mkBtn("Follow up →", THEME.accent, THEME.accentFg, function () {
       var t = (ta.value || "").trim();
       if (!t) return;
       // optimistic bubble
