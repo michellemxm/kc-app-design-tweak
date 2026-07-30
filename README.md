@@ -65,15 +65,18 @@ The UI is a hand-written federated ES module — it resolves React,
 **From GitHub (recommended for sharing):**
 
 ```bash
-git clone https://github.com/michellemxm/poke-and-prose.git
-kirocrew app install ./poke-and-prose
+git clone https://github.com/michellemxm/kc-app-design-tweak.git
+kirocrew app install ./kc-app-design-tweak
 kirocrew app enable poke-and-prose
 ```
 
 Then restart the host gateway (quit + reopen the app) so the backend spawns.
 
+> The install path is the cloned **folder**; `poke-and-prose` is the app's
+> internal id (unchanged by the repo rename) and is what `enable` takes.
+
 **Or via the App Store (registry):** add this repo to your host config under
-`registries` — `{ "name": "poke-and-prose", "repo": "https://github.com/michellemxm/poke-and-prose.git", "branch": "main" }` —
+`registries` — `{ "name": "kc-app-design-tweak", "repo": "https://github.com/michellemxm/kc-app-design-tweak.git", "branch": "main" }` —
 and install from the Apps page.
 
 > ⚠️ **Trust note:** enabling any app runs its code in-process with full
