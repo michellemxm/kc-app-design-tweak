@@ -266,6 +266,11 @@ export default function DesignTweak() {
   const [serving, setServing] = useState(false)
   const [repoUrl, setRepoUrl] = useState('')
   const [ddOpen, setDdOpen] = useState(false)
+  // Mount flag for the dropdown's entrance: false on the first frame, flipped
+  // on the next, so the panel transitions in instead of appearing instantly.
+  const [ddIn, setDdIn] = useState(false)
+  const ddTriggerRef = useRef(null)
+  const ddPanelRef = useRef(null)
   const [adding, setAdding] = useState(false)
   const [newPath, setNewPath] = useState('')
   const [pending, setPending] = useState([])
@@ -317,6 +322,34 @@ export default function DesignTweak() {
         : c
     }),
   })), [])
+
+  // Dismiss the app selector on an outside click or Escape, and drive its
+  // entrance. Uses mousedown (not click) so the menu closes on press rather
+  // than waiting for release, and `capture` so a stopPropagation() handler
+  // deeper in the tree cannot swallow the dismissal.
+  useEffect(() => {
+    if (!ddOpen) { setDdIn(false); return }
+    const raf = requestAnimationFrame(() => setDdIn(true))
+    const onDown = (e) => {
+      // "Outside" is anything that is neither the trigger nor the panel — note
+      // that the Connect button sits in the same row, so scoping to those two
+      // elements (rather than their shared parent) means clicking Connect
+      // dismisses the menu too.
+      const inTrigger = ddTriggerRef.current?.contains(e.target)
+      const inPanel = ddPanelRef.current?.contains(e.target)
+      if (!inTrigger && !inPanel) { setDdOpen(false); setAdding(false) }
+    }
+    const onKey = (e) => {
+      if (e.key === 'Escape') { setDdOpen(false); setAdding(false) }
+    }
+    document.addEventListener('mousedown', onDown, true)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      cancelAnimationFrame(raf)
+      document.removeEventListener('mousedown', onDown, true)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [ddOpen])
 
   const toggleReq = useCallback((id) => {
     setReqOpen((m) => ({ ...m, [id]: !m[id] }))
@@ -737,32 +770,44 @@ export default function DesignTweak() {
       ),
 
       // project dropdown + connect
-      h('div', { className: 'flex items-center gap-3 px-5 py-2 relative' },
-        h('button', {
-          onClick: () => { setDdOpen(!ddOpen); setAdding(false) },
-          className: 'flex-1 min-w-0 flex items-center gap-2 h-10 px-3 rounded-xl bg-bg-elevated border border-border text-[13px] font-bold text-text cursor-pointer',
-        },
-          h(Folder, { size: 16, className: 'shrink-0 text-muted' }),
-          h('span', { className: 'truncate' }, selected ? selected.name : 'Select a web app…'),
-          h(ChevronDown, { size: 16, className: 'ml-auto shrink-0 text-muted' }),
-        ),
-        connected
-          ? h('button', {
-              onClick: disconnect,
-              title: 'Click again to disconnect',
-              className: 'h-10 px-4 text-[13px] font-bold text-text cursor-pointer hover:bg-bg-elevated',
-              style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: '12px' },
-            }, 'Connected')
-          : h('button', {
-              onClick: connect, disabled: !selected,
-              className: 'h-10 px-4 bg-accent text-accent-fg text-[13px] font-bold cursor-pointer disabled:opacity-40',
-              style: { borderRadius: '12px' },
-            }, 'Connect'),
+      h('div', { className: 'flex items-center gap-3 px-5 py-2' },
+        // Trigger + panel share a positioned wrapper. The panel is inset to
+        // left:0/right:0 of THIS wrapper, so its width is structurally identical
+        // to the trigger's — no measurement, and content can never widen it.
+        h('div', { className: 'flex-1 min-w-0', style: { position: 'relative' } },
+          h('button', {
+            ref: ddTriggerRef,
+            onClick: () => { setDdOpen(!ddOpen); setAdding(false) },
+            className: 'w-full flex items-center gap-2 h-10 px-3 rounded-xl bg-bg-elevated border border-border text-[13px] font-bold text-text cursor-pointer',
+          },
+            h(Folder, { size: 16, className: 'shrink-0 text-muted' }),
+            h('span', { className: 'truncate' }, selected ? selected.name : 'Select a web app…'),
+            h(ChevronDown, { size: 16, className: 'ml-auto shrink-0 text-muted' }),
+          ),
 
-        // dropdown panel
-        ddOpen && h('div', {
-          className: 'absolute left-5 right-5 top-[52px] z-20 rounded-xl border border-border bg-card shadow-lg overflow-hidden',
-        },
+          // dropdown panel — drops DOWNWARD from the trigger's bottom edge.
+          //
+          // Geometry lives in inline styles on purpose: this app has no build
+          // step and borrows the host's compiled Tailwind, so any class KiroCrew
+          // does not itself use was purged. `left-5`, `right-5` and `top-[52px]`
+          // are all absent from the host bundle, which left top/left/right at
+          // `auto` — the panel then sat at its static position, vertically
+          // centred in this items-center row and sized by its own content.
+          ddOpen && h('div', {
+            ref: ddPanelRef,
+            className: 'rounded-xl border border-border bg-card shadow-lg overflow-hidden',
+            style: {
+              position: 'absolute',
+              top: 'calc(100% + 4px)',   // just below the trigger
+              left: 0,
+              right: 0,                  // == trigger width
+              zIndex: 20,
+              transformOrigin: 'top center',
+              transform: ddIn ? 'translateY(0)' : 'translateY(-4px)',
+              opacity: ddIn ? 1 : 0,
+              transition: 'transform 130ms cubic-bezier(.4,0,.2,1), opacity 110ms ease-out',
+            },
+          },
           // scrollable list: 4.5 items visible (item ≈ 40px → 180px)
           h('div', { style: { maxHeight: '180px', overflowY: 'auto' } },
             projects.length === 0
@@ -774,13 +819,19 @@ export default function DesignTweak() {
                   onMouseLeave: () => setHoverPid(''),
                   className: `w-full flex items-center gap-2 h-10 px-3 text-left text-[13px] cursor-pointer hover:bg-bg-elevated ${p.id === selectedId ? 'text-text font-bold' : 'text-muted'}`,
                 },
-                  h(Folder, { size: 14 }),
+                  h(Folder, { size: 14, className: 'shrink-0' }),
                   h('span', { className: 'truncate flex-1' }, p.name),
-                  hoverPid === p.id && h('button', {
+                  // Always occupies its 22px, only visibility toggles — a
+                  // conditionally-rendered button changed the row's content
+                  // width on hover, which shifted the name beside it.
+                  h('button', {
                     title: 'Remove from list',
                     onClick: (e) => { e.stopPropagation(); removeProject(p) },
                     className: 'flex items-center justify-center text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
-                    style: { width: '22px', height: '22px', borderRadius: '6px' },
+                    style: {
+                      width: '22px', height: '22px', borderRadius: '6px', flex: '0 0 auto',
+                      visibility: hoverPid === p.id ? 'visible' : 'hidden',
+                    },
                   }, h(X, { size: 14 })),
                 )),
           ),
@@ -802,8 +853,22 @@ export default function DesignTweak() {
                   title: 'Opens the macOS folder chooser',
                   className: 'w-full flex items-center gap-2 h-10 px-3 text-[13px] text-muted hover:text-text hover:bg-bg-elevated cursor-pointer',
                 }, h(Plus, { size: 14 }), 'load new app'),
+            ),
           ),
         ),
+
+        connected
+          ? h('button', {
+              onClick: disconnect,
+              title: 'Click again to disconnect',
+              className: 'shrink-0 h-10 px-4 text-[13px] font-bold text-text cursor-pointer hover:bg-bg-elevated',
+              style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: '12px' },
+            }, 'Connected')
+          : h('button', {
+              onClick: connect, disabled: !selected,
+              className: 'shrink-0 h-10 px-4 bg-accent text-accent-fg text-[13px] font-bold cursor-pointer disabled:opacity-40',
+              style: { borderRadius: '12px' },
+            }, 'Connect'),
       ),
 
       status && h('div', { className: 'px-5 py-1 text-[11px] text-muted truncate' }, status),
@@ -895,7 +960,10 @@ export default function DesignTweak() {
               sandbox: 'allow-scripts allow-same-origin allow-forms',
             }),
           )
-        : h('div', { className: 'flex-1 flex items-center justify-center text-muted text-sm px-10 text-center' },
+        : h('div', {
+            className: 'flex-1 flex items-center justify-center text-muted text-sm text-center',
+            style: { paddingLeft: '40px', paddingRight: '40px' },   // px-10 is not in the host bundle
+          },
             'No web app selected. Pick one in the dropdown — switching is instant.'),
 
       // bottom: action bar (fixed, 56px — 40px tab pill + 8px gap to each bar edge; matches History header)
