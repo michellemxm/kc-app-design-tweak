@@ -36,7 +36,21 @@ from urllib.parse import parse_qs, urlparse
 import urllib.request
 import urllib.error
 
-VERSION = "0.6.0"
+def _manifest_version() -> str:
+    """Read the version from app.json rather than duplicating it here.
+
+    A hardcoded constant drifts silently — this one sat at 0.6.0 while the
+    manifest said 0.7.1, so /health reported a version that had not been real for
+    two releases, which is worse than reporting nothing.
+    """
+    try:
+        p = Path(__file__).resolve().parent.parent / "app.json"
+        return str(json.loads(p.read_text("utf-8")).get("version", "")) or "0.0.0"
+    except (OSError, ValueError):
+        return "0.0.0"
+
+
+VERSION = _manifest_version()
 PORT = int(os.environ.get("PORT", 9110))
 APP_NAME = (
     os.environ.get("KIROCREW_APP_NAME")
@@ -217,7 +231,13 @@ def _summarize_comment(c: dict) -> dict:
         "count": len(elements),
         "mode": sel.get("mode", "single"),
         "previewUrl": c.get("previewUrl", ""),
+        "projectId": c.get("projectId", ""),
         "sourceFile": c.get("sourceFile", ""),
+        # Where the agent should edit, and how much to trust it:
+        # data-kiro-source → "high", React Fiber → "medium", neither → "low".
+        # Independent of how the page was served, so a dev-server project gets
+        # BETTER targeting than a proxied static folder, not worse.
+        "source": el.get("source") or {},
         "followUpTo": c.get("followUpTo", ""),
         "thread": c.get("thread") or [],
     }
@@ -244,8 +264,12 @@ def _summarize(req: dict) -> dict:
 def _proj_for_preview(preview_url: str) -> tuple[dict | None, str]:
     """Resolve (project, path-within-project) from a preview URL.
 
-    Preview URLs look like `/apps/<app>/api/proxy/<projectId>/<rel>`, so the
-    project id and the served file both fall out of the path.
+    Proxied preview URLs look like `/apps/<app>/api/proxy/<projectId>/<rel>`, so
+    the project id and the served file both fall out of the path. Returns
+    `(None, "")` for any URL that isn't ours — notably a dev-server URL like
+    `http://localhost:5173/pricing`, where the path is a ROUTE, not a file. Use
+    `_resolve_project` instead of calling this directly: identity should come
+    from an explicit id, with this as the fallback for older payloads.
     """
     marker = "/api/proxy/"
     i = str(preview_url).find(marker)
@@ -256,6 +280,53 @@ def _proj_for_preview(preview_url: str) -> tuple[dict | None, str]:
     rest = rel.split("/", 1)[1] if "/" in rel else ""
     proj = next((p for p in _CFG["projects"] if p["id"] == seg), None)
     return proj, rest
+
+
+def _project_by_id(project_id: str) -> dict | None:
+    if not project_id:
+        return None
+    return next((p for p in _CFG["projects"] if p["id"] == project_id), None)
+
+
+def _resolve_project(payload: dict) -> tuple[str, str, str]:
+    """Identify the project a captured comment belongs to.
+
+    Returns `(projectId, projectRoot, sourceFile)`.
+
+    Identity comes from an EXPLICIT `projectId` on the payload — the panel knows
+    which project it is previewing, so it says so. The URL is only parsed as a
+    fallback for payloads written before that field existed. This matters beyond
+    tidiness: pattern-matching `/api/proxy/<id>/` only works for content this
+    backend proxies, so a project previewed straight from its dev server would
+    otherwise resolve to no project at all — losing its pins, its per-comment
+    threads, and its grouping.
+
+    `sourceFile` is only meaningful when the URL names a served FILE. A
+    dev-server route (`/pricing`) is not a path on disk, so it is left empty and
+    the agent relies on the per-element `source` block (`data-kiro-source` →
+    high confidence, React Fiber → medium) instead.
+    """
+    preview_url = str(payload.get("previewUrl", ""))
+    explicit = str(payload.get("projectId", "") or "")
+
+    proj = _project_by_id(explicit)
+    served_rel = ""
+    if proj is not None:
+        # Trust the id; still read the served path off the URL when it IS ours,
+        # so proxied projects keep exact per-page source files.
+        url_proj, served_rel = _proj_for_preview(preview_url)
+        if url_proj is not None and url_proj["id"] != proj["id"]:
+            served_rel = ""       # URL disagrees with the id — don't guess a file
+    else:
+        proj, served_rel = _proj_for_preview(preview_url)
+
+    if proj is not None:
+        root = proj["path"]
+        return proj["id"], root, (str(Path(root) / served_rel) if served_rel else "")
+    if _ROOT:
+        return explicit, _ROOT, (str(Path(_ROOT) / served_rel) if served_rel else "")
+    return explicit, "", ""
+
 
 
 def _read_request(fp: Path) -> dict | None:
@@ -307,6 +378,7 @@ def _valid_target(url: str) -> bool:
 def _valid_root(path: str):
     """Resolve a folder path to serve. Returns a resolved Path or None if it is
     not an existing directory or is a sensitive credential location."""
+
     try:
         p = Path(os.path.expanduser(path)).resolve()
     except (ValueError, OSError):
@@ -346,7 +418,282 @@ def _guess_ctype(p: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Entry-point resolution.
+# Dev-server detection.
+#
+# A project registered as a folder may also be served by a dev server the user
+# already has running. Rather than guessing from a list of popular ports — which
+# picks the wrong server the moment two are up — identify it: every loopback
+# listener has a PID, every PID has a working directory, and the one whose
+# working directory sits inside the project folder IS that project's dev server.
+#
+# `lsof` is the only portable way to get that mapping without elevated
+# privileges, and the two invocations below work identically on macOS and Linux.
+# Detection is always best-effort: if lsof is missing or slow, callers fall back
+# to the manual URL field.
+# ---------------------------------------------------------------------------
+_LSOF_TIMEOUT = 4          # generous: lsof on a busy machine can take ~1s
+_PROBE_TIMEOUT = 1.5       # per-candidate HTTP probe
+
+
+def _lsof_fields(args: list[str]) -> list[dict]:
+    """Run lsof in field mode and return one dict per record.
+
+    Field output is a flat stream of `p<pid>` / `f<fd>` / `n<name>` lines where
+    the pid line begins a new process block, so `p` is carried forward.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(["lsof", *args], capture_output=True, text=True,
+                           timeout=_LSOF_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[dict] = []
+    pid = ""
+    for line in r.stdout.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            pid = val
+        elif tag == "n":
+            out.append({"pid": pid, "name": val})
+    return out
+
+
+def _loopback_listeners() -> dict[int, int]:
+    """{port: pid} for TCP listeners bound to loopback (or all interfaces)."""
+    found: dict[int, int] = {}
+    for rec in _lsof_fields(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn"]):
+        name = rec["name"]
+        if ":" not in name:
+            continue
+        host, _, port_s = name.rpartition(":")
+        host = host.strip("[]")
+        # `*` means all interfaces, which includes loopback.
+        if host not in ("127.0.0.1", "localhost", "::1", "*", ""):
+            continue
+        try:
+            port = int(port_s)
+            found[port] = int(rec["pid"])
+        except ValueError:
+            continue
+    return found
+
+
+def _cwd_for_pids(pids: list[int]) -> dict[int, str]:
+    """{pid: working directory} — one lsof call for the whole set."""
+    if not pids:
+        return {}
+    joined = ",".join(str(p) for p in dict.fromkeys(pids))
+    out: dict[int, str] = {}
+    for rec in _lsof_fields(["-a", "-p", joined, "-d", "cwd", "-Fn"]):
+        try:
+            out[int(rec["pid"])] = rec["name"]
+        except ValueError:
+            continue
+    return out
+
+
+def _serves_html(port: int) -> bool:
+    """Does this port answer with an HTML page?
+
+    Discriminates a dev server from the API server / test runner / language
+    server that may also be running out of the same folder. Deliberately lenient
+    about status: a dev server can answer `/` with a 404 and still be the right
+    target, so only the content type has to look like a page.
+    """
+    url = f"http://127.0.0.1:{port}/"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "DesignTweak-Detect"})
+        with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT) as resp:  # noqa: S310
+            return "text/html" in (resp.headers.get("Content-Type") or "").lower()
+    except urllib.error.HTTPError as exc:
+        return "text/html" in (exc.headers.get("Content-Type") or "").lower()
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _detect_dev_servers(root: Path, probe: bool = True) -> list[dict]:
+    """Dev servers plausibly serving `root`, best match first.
+
+    A candidate matches when the listening process's working directory is inside
+    the project folder — which also covers a monorepo whose server runs from
+    `<root>/apps/web`. Depth 0 (cwd IS the root) sorts first, since a server
+    started in the project root is the more likely target than one nested in it.
+    """
+    listeners = _loopback_listeners()
+    cwds = _cwd_for_pids(list(listeners.values()))
+
+    out: list[dict] = []
+    for port, pid in listeners.items():
+        cwd = cwds.get(pid, "")
+        if not cwd:
+            continue
+        try:
+            depth = len(Path(cwd).resolve().relative_to(root).parts)
+        except ValueError:
+            continue                      # cwd is not inside the project
+        out.append({
+            "port": port, "pid": pid, "cwd": cwd, "depth": depth,
+            "url": f"http://localhost:{port}",
+            "servesHtml": _serves_html(port) if probe else None,
+        })
+    # HTML-serving first, then shallowest cwd, then lowest port for stability.
+    out.sort(key=lambda c: (c["servesHtml"] is False, c["depth"], c["port"]))
+    return out
+
+
+def _auto_dev_server(root: Path) -> str:
+    """The one unambiguous dev-server URL for `root`, or "".
+
+    Returns a URL only when exactly ONE candidate serves HTML. With none there is
+    nothing to attach; with several, guessing would silently point the preview at
+    the wrong server, so the caller surfaces the list instead.
+    """
+    html = [c for c in _detect_dev_servers(root) if c["servesHtml"]]
+    return html[0]["url"] if len(html) == 1 else ""
+
+
+# ---------------------------------------------------------------------------
+# Dev-server processes we started.
+#
+# Spawned in their own session (`start_new_session`) so the whole process tree can
+# be signalled as a group: `npm run dev` forks the real server as a child, so
+# killing only the npm pid leaves an orphan holding the port. Registered with
+# atexit so a gateway shutdown does not leak them either.
+# ---------------------------------------------------------------------------
+_DEV_PROCS: dict[str, dict] = {}      # projectId -> {proc, pgid, url, log}
+_START_TIMEOUT = 45                   # cold Vite/Next can take a while
+_STOP_GRACE = 3
+
+
+def _stop_dev_proc(project_id: str) -> bool:
+    """Signal the whole process group, escalating only if it ignores SIGTERM."""
+    import signal
+    rec = _DEV_PROCS.pop(project_id, None)
+    if not rec:
+        return False
+    proc, pgid = rec["proc"], rec.get("pgid")
+    try:
+        if pgid:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+        try:
+            proc.wait(timeout=_STOP_GRACE)
+        except Exception:                                  # noqa: BLE001
+            if pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass                                               # already gone
+    return True
+
+
+def _stop_all_dev_procs() -> None:
+    for pid in list(_DEV_PROCS):
+        _stop_dev_proc(pid)
+
+
+import atexit  # noqa: E402
+atexit.register(_stop_all_dev_procs)
+
+
+def _dev_proc_alive(project_id: str) -> bool:
+    rec = _DEV_PROCS.get(project_id)
+    return bool(rec and rec["proc"].poll() is None)
+
+
+def _start_dev_proc(project_id: str, root: Path) -> dict:
+    """Start the project's dev server and wait until it is listening.
+
+    Returns `{"ok": True, "url": …}` or `{"ok": False, "error": …, "log": …}`.
+
+    The port is NOT chosen here — the dev tool picks its own, and we then find it
+    by matching a listening port back to a process rooted in this folder. That
+    avoids a per-framework table of port flags, and it is also what makes the
+    result honest: we report the port something is actually listening on.
+    """
+    import subprocess
+    if _dev_proc_alive(project_id):
+        return {"ok": True, "url": _DEV_PROCS[project_id]["url"], "already": True}
+    _stop_dev_proc(project_id)                    # clear a dead record
+
+    cmd = _dev_command(root)
+    if not cmd:
+        return {"ok": False, "error":
+                "No dev script found in package.json (looked for: "
+                + ", ".join(_DEV_SCRIPTS) + ")."}
+
+    # Resolve the package manager absolutely — the gateway hands this backend a
+    # minimal PATH, so spawning by bare name fails with ENOENT even though the
+    # same command works in a terminal.
+    binary = _resolve_bin(cmd[0])
+    if binary is None:
+        looked = ", ".join(str(d) for d in _node_bin_dirs()[:4])
+        return {"ok": False, "error":
+                f"Could not find `{cmd[0]}`. Design Tweak's backend does not inherit "
+                f"your shell's PATH, and {cmd[0]} is not in the usual places "
+                f"({looked}…). Start the dev server yourself, then press "
+                f"Dev server to connect to it."}
+
+    if not (root / "node_modules").is_dir():
+        return {"ok": False, "error":
+                f"node_modules is missing — run `{cmd[0]} install` in {root.name} first."}
+
+    log = DATA_DIR / f"devserver-{project_id}.log"
+    try:
+        handle = log.open("wb")
+        proc = subprocess.Popen(                  # noqa: S603 (user's own project)
+            [str(binary), *cmd[1:]], cwd=str(root),
+            stdout=handle, stderr=subprocess.STDOUT,
+            env=_child_env(binary.parent),        # node must be on PATH for npm's own child
+            start_new_session=True,               # own process group → killable as a tree
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"ok": False, "error": f"could not start `{' '.join(cmd)}`: {exc}"}
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    _DEV_PROCS[project_id] = {"proc": proc, "pgid": pgid, "url": "", "log": str(log)}
+
+    # Poll for the port it chose. Probing is skipped while polling: an HTTP request
+    # per candidate per tick is wasteful, and a dev server that is listening but
+    # still compiling would fail the HTML check and look like a miss.
+    deadline = time.time() + _START_TIMEOUT
+    while time.time() < deadline:
+        if proc.poll() is not None:               # exited — surface its own output
+            tail = ""
+            try:
+                tail = log.read_text("utf-8", errors="replace")[-800:]
+            except OSError:
+                pass
+            _DEV_PROCS.pop(project_id, None)
+            return {"ok": False, "error": f"`{' '.join(cmd)}` exited ({proc.returncode}).",
+                    "log": tail}
+        for cand in _detect_dev_servers(root, probe=False):
+            if cand["pid"] == proc.pid or (pgid and _same_group(cand["pid"], pgid)):
+                _DEV_PROCS[project_id]["url"] = cand["url"]
+                return {"ok": True, "url": cand["url"], "port": cand["port"]}
+        time.sleep(0.4)
+
+    _stop_dev_proc(project_id)
+    return {"ok": False, "error":
+            f"`{' '.join(cmd)}` did not start listening within {_START_TIMEOUT}s."}
+
+
+def _same_group(pid: int, pgid: int) -> bool:
+    """Is `pid` in process group `pgid`? The listener is usually a CHILD of npm."""
+    try:
+        return os.getpgid(pid) == pgid
+    except OSError:
+        return False
+
+
+
 #
 # Not every project folder has index.html at its top level: a repo may keep the
 # static site in public/ or dist/, or nest the app in a subfolder (mono-repos).
@@ -368,6 +715,164 @@ _SCAN_SKIP_DIRS = {
     "__pycache__", ".venv", "venv", "coverage", "htmlcov", ".pytest_cache",
     "target", "vendor", ".idea", ".vscode",
 }
+
+# A module script pointing at TypeScript/JSX is a BUNDLER TEMPLATE, not a page.
+# Browsers cannot execute .ts/.tsx/.jsx, so serving such an index.html statically
+# yields HTTP 200, valid HTML, and a completely blank render — the worst kind of
+# failure, because every layer reports success. Detect it and say so instead.
+#
+# Attributes are checked independently of order: `<script type="module" src=…>`
+# and `<script src=… type="module">` are both valid HTML and both appear in real
+# templates, so a single ordered pattern silently misses half of them.
+_SCRIPT_TAG_RE = re.compile(r"<script\b([^>]*)>", re.IGNORECASE)
+_ATTR_TYPE_MODULE_RE = re.compile(r"""\btype\s*=\s*["']module["']""", re.IGNORECASE)
+_ATTR_SRC_RE = re.compile(r"""\bsrc\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_UNBUNDLED_EXTS = (".ts", ".tsx", ".jsx")
+
+
+def _unbundled_entry(html: bytes) -> str:
+    """The first TS/JSX module script in this page, or "" if it can stand alone."""
+    try:
+        text = html.decode("utf-8", "replace")
+    except (UnicodeDecodeError, AttributeError):
+        return ""
+    for m in _SCRIPT_TAG_RE.finditer(text):
+        attrs = m.group(1)
+        if not _ATTR_TYPE_MODULE_RE.search(attrs):
+            continue
+        src_m = _ATTR_SRC_RE.search(attrs)
+        if not src_m:
+            continue                      # inline module — nothing to fetch
+        src = src_m.group(1)
+        bare = src.split("?")[0].split("#")[0].lower()
+        if bare.endswith(_UNBUNDLED_EXTS):
+            return src
+    return ""
+
+
+
+# Where Node toolchains actually live. The gateway spawns this backend with a
+# minimal PATH — typically /usr/bin:/bin:/usr/sbin:/sbin — so `npm` is NOT
+# resolvable by name even though it works fine in the user's terminal. Two things
+# follow: the binary has to be found absolutely, AND the child's PATH has to
+# include its directory, because `npm run dev` shells out to `node` itself.
+_NODE_BIN_DIRS = (
+    "/opt/homebrew/bin",                 # homebrew, Apple silicon
+    "/usr/local/bin",                    # homebrew (Intel) / manual installs
+    "/opt/local/bin",                    # MacPorts
+    "/usr/bin",
+    "~/.volta/bin",
+    "~/.bun/bin",
+    "~/.asdf/shims",
+    "~/.local/share/fnm/aliases/default/bin",
+    "~/Library/pnpm",
+)
+# nvm keeps a directory per version; prefer the newest.
+_NVM_GLOB = "~/.nvm/versions/node/*/bin"
+
+
+def _node_bin_dirs() -> list[Path]:
+    dirs = [Path(d).expanduser() for d in _NODE_BIN_DIRS]
+    try:
+        import glob
+        nvm = sorted(glob.glob(os.path.expanduser(_NVM_GLOB)), reverse=True)
+        dirs = [Path(p) for p in nvm] + dirs
+    except OSError:
+        pass
+    return [d for d in dirs if d.is_dir()]
+
+
+def _resolve_bin(name: str) -> Path | None:
+    """Absolute path to a package-manager binary, or None.
+
+    `shutil.which` is tried first so a properly-configured PATH wins; the
+    directory scan is the fallback for the gateway's stripped environment.
+    """
+    import shutil
+    found = shutil.which(name)
+    if found:
+        return Path(found)
+    for d in _node_bin_dirs():
+        cand = d / name
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _child_env(bin_dir: Path) -> dict:
+    """Environment for the dev server: our own, with the toolchain on PATH."""
+    env = dict(os.environ)
+    extra = [str(bin_dir)] + [str(d) for d in _node_bin_dirs()]
+    seen, parts = set(), []
+    for p in extra + env.get("PATH", "").split(os.pathsep):
+        if p and p not in seen:
+            seen.add(p)
+            parts.append(p)
+    env["PATH"] = os.pathsep.join(parts)
+    env.pop("NODE_OPTIONS", None)        # ours would leak into their build
+    return env
+
+
+def _pkg_scripts(root: Path) -> dict:
+    try:
+        data = json.loads((root / "package.json").read_text("utf-8"))
+        s = data.get("scripts")
+        return s if isinstance(s, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# Lockfile → the package manager that project expects. Order matters: a repo can
+# carry more than one, and the more specific manager wins over npm's default.
+_LOCKFILES = (
+    ("pnpm-lock.yaml", "pnpm"),
+    ("bun.lockb", "bun"),
+    ("yarn.lock", "yarn"),
+    ("package-lock.json", "npm"),
+)
+# Script names that mean "run the dev server", best first.
+_DEV_SCRIPTS = ("dev", "start:dev", "dev:web", "serve", "start")
+
+
+def _dev_command(root: Path) -> list[str]:
+    """The command that starts this project's dev server, or [] if none is obvious.
+
+    Deliberately does NOT pass a port: the flag differs per framework (`--port` for
+    Vite, `-p` for Next, …) and guessing wrong just fails. Let the tool choose its
+    own port and find it afterwards with `_detect_dev_servers`.
+    """
+    scripts = _pkg_scripts(root)
+    script = next((s for s in _DEV_SCRIPTS if s in scripts), "")
+    if not script:
+        return []
+    pm = next((m for f, m in _LOCKFILES if (root / f).is_file()), "npm")
+    return [pm, "run", script] if pm != "bun" else ["bun", "run", script]
+
+
+def _classify_project(root: Path) -> dict:
+    """Can this folder be previewed from disk, or does it need a dev server?
+
+    The distinction is not "does it have an index.html" — a Vite project has one,
+    and serving it statically yields a blank page because its only script is
+    TypeScript. So: resolve the entry, and if that entry is a bundler template,
+    the folder needs its dev server.
+    """
+    entry = _find_entry(root)
+    unbundled = ""
+    if entry is not None:
+        try:
+            unbundled = _unbundled_entry(entry.read_bytes())
+        except OSError:
+            unbundled = ""
+    cmd = _dev_command(root)
+    needs = bool(unbundled) or (entry is None and bool(cmd))
+    return {
+        "needsDevServer": needs,
+        "devCommand": " ".join(cmd),
+        # Named so the panel can explain WHY rather than just asserting it.
+        "unbundledEntry": unbundled,
+        "hasEntry": entry is not None,
+    }
 
 
 def _find_entry(folder: Path):
@@ -483,6 +988,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, newest or {})
             if route == "/projects":
                 return self._h_projects_list()
+            if route == "/detect-dev-server":
+                return self._h_detect_dev_server(qs)
             if route == "/history":
                 done = []
                 for fp in sorted(HANDLED_DIR.glob("*.json"), reverse=True)[:50]:
@@ -516,6 +1023,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._h_projects_select()
             if route == "/projects/remove":
                 return self._h_projects_remove()
+            if route == "/projects/preview-url":
+                return self._h_projects_preview_url()
+            if route == "/dev-server/start":
+                return self._h_dev_server_start(qs)
+            if route == "/dev-server/stop":
+                return self._h_dev_server_stop(qs)
             if route == "/pick-folder":
                 return self._h_pick_folder()
             if route == "/send":
@@ -558,20 +1071,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "selection.elements is required"})
 
         preview_url = str(payload.get("previewUrl", ""))
-        proj, rest = _proj_for_preview(preview_url)
-        project_id = proj["id"] if proj else ""
-
-        # Resolve the source file for THIS comment (per-comment, because a batch
-        # can span several pages of the same app).
-        if proj is not None:
-            project_root = proj["path"]
-            source_file = str(Path(project_root) / (rest or "index.html"))
-        elif _ROOT:
-            project_root = _ROOT
-            source_file = str(Path(_ROOT) / (rest or "index.html"))
-        else:
-            project_root = ""
-            source_file = ""
+        project_id, project_root, source_file = _resolve_project(payload)
 
         # Find or open the draft for this project.
         fp = _open_draft_file(project_id)
@@ -615,6 +1115,11 @@ class Handler(BaseHTTPRequestHandler):
             "createdAt": created,
             "selection": sel,
             "previewUrl": preview_url,
+            # Stored per comment as well as on the request: the panel matches
+            # pins to the previewed project by this id, and matching on the id
+            # (rather than on the shape of previewUrl) is what lets a project
+            # previewed straight from its dev server keep its pins.
+            "projectId": project_id,
             "sourceFile": source_file,
             "followUpTo": follow_up_to,
             # The user's own comment seeds the thread so the in-preview bubble
@@ -738,13 +1243,68 @@ class Handler(BaseHTTPRequestHandler):
     def _h_projects_list(self) -> None:
         active = _active_project()
         serving = bool(_ROOT and active and str(Path(active["path"]).resolve()) == _ROOT)
+        # Classification is computed per request, never stored: a folder becomes
+        # static the moment its build lands in dist/, and a stale flag would keep
+        # showing "needs a dev server" for something that now previews fine.
+        out = []
+        for p in _CFG["projects"]:
+            row = dict(p)
+            root = _valid_root(p["path"])
+            row.update(_classify_project(root) if root else {
+                "needsDevServer": False, "devCommand": "",
+                "unbundledEntry": "", "hasEntry": False,
+            })
+            row["devRunning"] = _dev_proc_alive(p["id"])
+            out.append(row)
         return self._json(200, {
-            "projects": _CFG["projects"],
+            "projects": out,
             "activeId": _CFG["activeId"],
             "serving": serving,
             "repoUrl": REPO_URL,
             "version": VERSION,
         })
+
+    def _h_dev_server_start(self, qs: dict) -> None:
+        """Start the project's own dev server and point the preview at it."""
+        pid = (qs.get("id") or [""])[0]
+        proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+        if proj is None:
+            return self._json(404, {"error": "project not found"})
+        root = _valid_root(proj["path"])
+        if root is None:
+            return self._json(400, {"error": f"folder no longer readable: {proj['path']}"})
+
+        # Already running elsewhere (started by hand in a terminal)? Adopt it
+        # rather than starting a second one on another port.
+        adopted = _auto_dev_server(root)
+        if adopted:
+            proj["previewUrl"] = adopted
+            _save_cfg(_CFG)
+            return self._json(200, {"ok": True, "url": adopted, "adopted": True,
+                                    "project": proj})
+
+        res = _start_dev_proc(pid, root)
+        if not res.get("ok"):
+            return self._json(200, res)          # 200: the error text IS the answer
+        proj["previewUrl"] = res["url"]
+        _save_cfg(_CFG)
+        return self._json(200, {**res, "project": proj})
+
+    def _h_dev_server_stop(self, qs: dict) -> None:
+        """Stop a dev server WE started and revert the preview to serving from disk.
+
+        A server the user started themselves is left running — Design Tweak did not
+        start it, so killing it would be a surprise. Its URL is just forgotten.
+        """
+        pid = (qs.get("id") or [""])[0]
+        proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+        if proj is None:
+            return self._json(404, {"error": "project not found"})
+        stopped = _stop_dev_proc(pid)
+        proj.pop("previewUrl", None)
+        _save_cfg(_CFG)
+        return self._json(200, {"ok": True, "stopped": stopped, "project": proj})
+
 
     def _h_projects_add(self) -> None:
         data = self._read_body()
@@ -752,11 +1312,96 @@ class Handler(BaseHTTPRequestHandler):
         root = _valid_root(raw)
         if root is None:
             return self._json(400, {"error": f"not a readable folder: {raw}"})
+        # Optional dev-server URL. A project is always identified by its FOLDER —
+        # that is where the agent edits — and the URL only changes how it is
+        # previewed: framed directly instead of proxied from disk. Framework
+        # projects need that because this backend cannot proxy a WebSocket, so
+        # HMR dies behind the proxy.
+        preview_url = str(data.get("previewUrl", "") or "").strip().rstrip("/")
+        if preview_url and not _valid_target(preview_url):
+            return self._json(400, {
+                "error": "dev server URL must be http://localhost:PORT or http://127.0.0.1:PORT",
+            })
         for p in _CFG["projects"]:
             if str(Path(p["path"]).resolve()) == str(root):
+                if preview_url and p.get("previewUrl", "") != preview_url:
+                    p["previewUrl"] = preview_url
+                    _save_cfg(_CFG)
+                    return self._json(200, {"ok": True, "project": p, "existing": True,
+                                            "updated": "previewUrl"})
                 return self._json(200, {"ok": True, "project": p, "existing": True})
         proj = {"id": uuid.uuid4().hex[:8], "path": str(root), "name": root.name}
+
+        # No URL typed? Look for a dev server already serving this folder. Only
+        # an UNAMBIGUOUS match is attached (exactly one candidate serving HTML) —
+        # with several running, silently picking one would point the preview at
+        # the wrong app, so they are returned for the user to choose instead.
+        detected = []
+        if preview_url:
+            proj["previewUrl"] = preview_url
+        else:
+            detected = _detect_dev_servers(root)
+            auto = [c for c in detected if c["servesHtml"]]
+            if len(auto) == 1:
+                proj["previewUrl"] = auto[0]["url"]
+
         _CFG["projects"].append(proj)
+        _save_cfg(_CFG)
+        return self._json(200, {
+            "ok": True,
+            "project": proj,
+            "detected": detected,
+            "autoDetected": bool(not preview_url and proj.get("previewUrl")),
+        })
+
+    def _h_detect_dev_server(self, qs: dict) -> None:
+        """Dev servers plausibly serving a project — for the UI's Detect button.
+
+        Takes either `?id=<projectId>` or `?path=<folder>` so it works before a
+        project is registered as well as after.
+        """
+        pid = (qs.get("id") or [""])[0]
+        raw = (qs.get("path") or [""])[0]
+        if pid:
+            proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+            if proj is None:
+                return self._json(404, {"error": "project not found"})
+            raw = proj["path"]
+        root = _valid_root(raw)
+        if root is None:
+            return self._json(400, {"error": f"not a readable folder: {raw}"})
+        candidates = _detect_dev_servers(root)
+        html = [c for c in candidates if c["servesHtml"]]
+        return self._json(200, {
+            "ok": True,
+            "root": str(root),
+            "candidates": candidates,
+            # Only offered when unambiguous, matching add-time behaviour.
+            "suggested": html[0]["url"] if len(html) == 1 else "",
+        })
+
+
+    def _h_projects_preview_url(self) -> None:
+        """Set or clear a registered project's dev-server URL.
+
+        Sending an empty `previewUrl` reverts the project to proxied-from-disk,
+        which is the right move when the dev server is not running: the static
+        proxy still renders something, where a dead URL frames an error page.
+        """
+        data = self._read_body()
+        pid = str(data.get("id", ""))
+        proj = next((p for p in _CFG["projects"] if p["id"] == pid), None)
+        if proj is None:
+            return self._json(404, {"error": "project not found"})
+        url = str(data.get("previewUrl", "") or "").strip().rstrip("/")
+        if url and not _valid_target(url):
+            return self._json(400, {
+                "error": "dev server URL must be http://localhost:PORT or http://127.0.0.1:PORT",
+            })
+        if url:
+            proj["previewUrl"] = url
+        else:
+            proj.pop("previewUrl", None)
         _save_cfg(_CFG)
         return self._json(200, {"ok": True, "project": proj})
 
@@ -1043,6 +1688,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_raw(500, "text/plain", str(exc).encode())
         ctype = _guess_ctype(target)
         if "text/html" in ctype:
+            # A bundler template cannot render statically — bail out with an
+            # explanation rather than a page guaranteed to come up blank.
+            entry = _unbundled_entry(data)
+            if entry:
+                return self._h_needs_dev_server(root, target, entry)
             # <base> must point at the SERVED FILE's own directory, not the
             # project root — otherwise an index.html living in public/ or app/
             # resolves its relative assets one level too high and renders blank.
@@ -1054,6 +1704,52 @@ class Handler(BaseHTTPRequestHandler):
             data = _rewrite_html(data, html_base)
             ctype = "text/html; charset=utf-8"
         return self._send_raw(200, ctype, data)
+
+    def _h_needs_dev_server(self, root: Path, page: Path, entry: str) -> None:
+        """The page is a bundler template — explain that, don't render a blank.
+
+        `<script type="module" src="…/main.tsx">` needs Vite (or equivalent) to
+        transform it. Served from disk the browser gets TypeScript, refuses to
+        execute it, and leaves an empty `#root`: HTTP 200, valid HTML, nothing on
+        screen. Silent success is the worst outcome here, so say what is wrong and
+        name the two ways out.
+        """
+        built = [d for d in ("dist", "build", "out", ".output/public") if (root / d).is_dir()]
+        built_hint = (
+            "<p>This project has a <code>" + "</code>, <code>".join(built) +
+            "</code> folder — if that is a finished build, register THAT folder "
+            "instead and it will preview from disk.</p>"
+        ) if built else ""
+        page_rel = page.name
+        page_disp = _html.escape(page_rel)
+        entry_disp = _html.escape(entry)
+        body = (
+            f"<h3>{page_disp} needs a dev server</h3>"
+            f"<p>Its only script is <code>{entry_disp}</code> — TypeScript/JSX, which "
+            "the browser cannot run. A bundler has to transform it, so serving these "
+            "files from disk renders an empty page.</p>"
+            "<p><b>Start this project's dev server</b> (<code>npm run dev</code>), then "
+            "press <b>Dev server</b> in the bar below the preview. Design Tweak will "
+            "frame it directly, hot reload keeps working, and select-to-edit still "
+            "works — add <code>vite-plugin-kiro-source</code> for exact "
+            "<code>file:line:col</code> targeting.</p>"
+            f"{built_hint}"
+        )
+        page_html = (
+            "<!doctype html><meta charset='utf-8'>"
+            "<style>"
+            "body{font:14px/1.6 system-ui,-apple-system,sans-serif;padding:28px 32px;"
+            "color:#e6e6e6;background:#151517;max-width:56ch}"
+            "h3{margin:0 0 12px;font-size:15px;font-weight:600}"
+            "code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;"
+            "background:#26262a;padding:1px 5px;border-radius:4px}"
+            "p{margin:0 0 10px}b{color:#fff}"
+            "</style>"
+            f"{body}"
+        )
+        # 200, not an error: the file was found and read fine. The page IS the
+        # answer, and a 4xx here would trip the panel's own error handling.
+        return self._send_raw(200, "text/html; charset=utf-8", page_html.encode("utf-8"))
 
     def _h_no_entry(self, root: Path, folder: Path, base: str, missing: str = "") -> None:
         """404 page that explains WHY nothing rendered and offers what we found.

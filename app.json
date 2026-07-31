@@ -1,10 +1,10 @@
 {
   "name": "poke-and-prose",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "repository": "https://github.com/michellemxm/kc-app-design-tweak",
   "displayName": "Design Tweak",
   "iconUrl": "/apps/poke-and-prose/ui/icon.svg",
-  "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent — like Figma comments, but for code.",
+  "description": "Visually select elements in your live app preview and turn them into scoped, source-mapped edit requests for the agent \u2014 like Figma comments, but for code.",
   "author": "mxiaomen",
   "license": "MIT",
   "tags": [
