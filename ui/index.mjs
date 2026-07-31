@@ -79,12 +79,34 @@ function timeAgo(iso) {
 }
 
 // Request-level chip. A request's status is derived from its comments, so the
-// in-progress label doubles as a progress read-out ("1 of 3 done").
+// chip carries the counts too — it is the only place the request row states how
+// many comments it holds ("2 done", "1 in progress, 1 done").
 function reqChip(req) {
-  const n = (req.comments || []).length
-  if (req.status === 'draft') return { label: 'draft · not sent', fg: 'var(--muted)', bg: 'var(--bg-elevated)' }
-  if (req.status === 'done') return { label: 'done', fg: 'var(--ok)', bg: 'var(--ok-subtle)' }
-  return { label: `${req.doneCount || 0} of ${n} done`, fg: 'var(--accent)', bg: 'var(--accent-subtle)' }
+  const comments = req.comments || []
+  const n = comments.length
+  const done = comments.filter((c) => c.status === 'done').length
+  const prog = comments.filter((c) => c.status === 'sent').length
+  const queued = n - done - prog
+
+  if (req.status === 'draft') {
+    return { label: `${n} not sent`, fg: 'var(--muted)', bg: 'var(--bg-elevated)' }
+  }
+  if (req.status === 'done') {
+    return { label: `${n} done`, fg: 'var(--ok)', bg: 'var(--ok-subtle)' }
+  }
+  // In flight: name only the groups that actually have members, so a uniform
+  // batch reads "2 in progress" rather than "2 in progress, 0 done".
+  const parts = []
+  if (prog) parts.push(`${prog} in progress`)
+  if (done) parts.push(`${done} done`)
+  // `queued` should be empty — sending flips every comment to sent — but a
+  // comment left at `new` in a sent request would otherwise vanish from the count.
+  if (queued) parts.push(`${queued} queued`)
+  return {
+    label: parts.join(', ') || `${n} in progress`,
+    fg: 'var(--accent)',
+    bg: 'var(--accent-subtle)',
+  }
 }
 
 // Per-comment status dot — the Option B "status-forward" cue.
@@ -190,10 +212,6 @@ function RequestGroup({
         className: 'text-[11px] px-2 py-[2px] rounded-full font-medium shrink-0',
         style: { color: chip.fg, background: chip.bg },
       }, chip.label),
-      h('span', {
-        className: 'text-[11px] text-muted shrink-0',
-        style: { fontVariantNumeric: 'tabular-nums' },
-      }, String(comments.length)),
       !done && hovered && !isDraft && h('div', { className: 'flex items-center gap-0.5 shrink-0' },
         iconBtn('Open in chat', h(ChatOpenIcon, { size: 13 }), onOpenChat),
         iconBtn('Archive to History', h(ArchiveIcon, { size: 13 }), onArchive),
