@@ -273,6 +273,11 @@ export default function DesignTweak() {
   const ddPanelRef = useRef(null)
   const [adding, setAdding] = useState(false)
   const [newPath, setNewPath] = useState('')
+  const [detecting, setDetecting] = useState(false)
+  const [devOpen, setDevOpen] = useState(false)     // dev-server editor in the action bar
+  const [devDraft, setDevDraft] = useState('')
+  const [starting, setStarting] = useState(false)
+  const [devError, setDevError] = useState('')
   const [pending, setPending] = useState([])
   const [history, setHistory] = useState([])
   const [histOpen, setHistOpen] = useState(false)
@@ -492,11 +497,22 @@ export default function DesignTweak() {
         setNewPath(''); setAdding(false); setDdOpen(false)
         switchTo(out.project)   // newly added apps preview immediately
         refresh()
-        setStatus(out.existing ? `Already registered — switched to ${out.project.name}.` : `Added ${out.project.name} — previewing.`)
+        setStatus(
+          out.updated === 'previewUrl' ? `Set dev server for ${out.project.name}.`
+            : out.existing ? `Already registered — switched to ${out.project.name}.`
+              : out.autoDetected
+                ? `Added ${out.project.name} — found its dev server at ${out.project.previewUrl}.`
+                : (out.detected || []).length > 1
+                  ? `Added ${out.project.name} — ${out.detected.length} dev servers match this folder, so none was assumed. Set one in the dropdown.`
+                  : `Added ${out.project.name}${out.project.previewUrl ? ' (dev server)' : ''} — previewing.`,
+        )
       } else setStatus(`Add failed: ${out?.error}`)
     } catch (err) { setStatus(`Add failed: ${err?.message || err}`) }
   }, [api, newPath, refresh, switchTo])
 
+  // Picking a folder registers it straight away — the simple flow. Whether it
+  // then previews from disk or needs a dev server is the backend's call, and the
+  // preview panel says which.
   const pickFolder = useCallback(async () => {
     setStatus('Opening folder picker… (check your Mac for the dialog)')
     try {
@@ -600,7 +616,10 @@ export default function DesignTweak() {
       // is an explicit, separate step.
       if (d.type === 'capture' && d.payload) {
         try {
-          const out = await api.post(`${API_BASE}/submit`, d.payload)
+          // Stamp the project explicitly. The overlay only knows its own page
+          // URL, and the backend can only infer a project from a URL it proxies
+          // — so the panel, which knows exactly what it is previewing, says so.
+          const out = await api.post(`${API_BASE}/submit`, { ...d.payload, projectId: previewId })
           if (out?.ok) {
             postToOverlay({
               type: 'created', clientRef: d.clientRef,
@@ -628,6 +647,7 @@ export default function DesignTweak() {
             type: 'visual_edit_request',
             comment: d.text,
             followUpTo: d.id,
+            projectId: previewId,
             previewUrl: origin.comment.previewUrl,
             selection: { mode: 'single', elements: [{ locator: origin.comment.locator }] },
           })
@@ -644,6 +664,112 @@ export default function DesignTweak() {
     return () => window.removeEventListener('message', onMsg)
   }, [api, postToOverlay, summarizeEl, refresh])
 
+  // Does a comment belong to the project currently in the preview?
+  //
+  // Matches on the explicit projectId the backend stamps at capture time. The
+  // previewUrl check is only a fallback for comments captured before that field
+  // existed — on its own it can recognise nothing but URLs this backend
+  // proxies, so a project previewed straight from its dev server (no
+  // `/proxy/<id>/` in the URL) would lose every pin on the first reload.
+  const belongsToPreview = useCallback((c) => {
+    if (!previewId) return false
+    if (c?.projectId) return c.projectId === previewId
+    return (c?.previewUrl || '').includes(`/proxy/${previewId}/`)
+  }, [previewId])
+
+  // Where the preview iframe points. A project with a dev-server URL is framed
+  // DIRECTLY at it — going through our proxy would work for plain GETs but kill
+  // HMR, since this backend cannot upgrade a WebSocket. Everything else is
+  // proxied from disk as before. The nonce is the reload lever in both cases.
+  const previewProject = projects.find((p) => p.id === previewId)
+  const previewSrc = previewProject?.previewUrl
+    ? `${previewProject.previewUrl}${previewProject.previewUrl.includes('?') ? '&' : '?'}_t=${previewNonce}`
+    : `${API_BASE}/proxy/${previewId}/?_t=${previewNonce}`
+
+  // Preview lifecycle: 'loading' → 'ready', or → 'unreachable'.
+  //
+  // A blank iframe is ambiguous — still fetching, dev server not started, backend
+  // restarting — and a cross-origin frame will not tell us which, so we probe
+  // alongside it and report what we can actually establish.
+  //
+  // Who wins differs by origin, and getting this backwards hides a WORKING
+  // preview behind an error card:
+  //   • same-origin (our proxy) — `onLoad` is trustworthy, so it wins outright.
+  //     The probe only exists to catch a backend that never answers.
+  //   • cross-origin (a dev server) — Chrome fires `load` for its own
+  //     "can't connect" page, so `onLoad` alone would report success on a dead
+  //     server. Readiness there waits for the probe to come back clean.
+  const [previewState, setPreviewState] = useState('loading')
+  const [previewNote, setPreviewNote] = useState('')
+  const isDevServer = !!previewProject?.previewUrl
+  const probeOkRef = useRef(false)
+  const framedRef = useRef(false)
+
+  // Called by the iframe's onLoad.
+  //   • same-origin — the frame rendering IS the answer, whatever the probe said.
+  //     It overrides an earlier failure: a preview that visibly works must never
+  //     stay behind an error card.
+  //   • dev server — Chrome fires load for its own "can't connect" page, so a
+  //     frame alone proves nothing; wait for the probe, and never override a
+  //     probe that already failed.
+  const markFramed = useCallback(() => {
+    framedRef.current = true
+    setPreviewState((s) => {
+      if (!isDevServer) return 'ready'
+      if (s === 'unreachable') return s
+      return probeOkRef.current ? 'ready' : s
+    })
+  }, [isDevServer])
+
+  useEffect(() => {
+    if (!previewId) return
+    setPreviewState('loading')
+    setPreviewNote('')
+    probeOkRef.current = false
+    framedRef.current = false
+    let cancelled = false
+
+    const probe = async () => {
+      try {
+        if (isDevServer) {
+          // Opaque by design; all we learn is reachable vs not, which is the
+          // only thing that matters for a server we do not control.
+          await fetch(previewSrc, { mode: 'no-cors', cache: 'no-store' })
+        } else {
+          const r = await fetch(previewSrc, { cache: 'no-store' })
+          // A 4xx is deliberately NOT an error: the backend answers a missing
+          // entry point with a diagnostic page listing the HTML it did find,
+          // which is more useful than anything this overlay could say.
+          if (r.status >= 500) throw new Error(`backend returned ${r.status}`)
+        }
+        if (cancelled) return
+        probeOkRef.current = true
+        if (framedRef.current) setPreviewState((s) => (s === 'unreachable' ? s : 'ready'))
+      } catch (err) {
+        if (cancelled) return
+        // Never let a failed probe overrule a frame that already rendered — a
+        // same-origin fetch can fail for reasons the iframe does not care about.
+        if (framedRef.current && !isDevServer) return
+        setPreviewState('unreachable')
+        setPreviewNote(String(err?.message || err))
+      }
+    }
+    void probe()
+
+    // Backstop for a server that accepts the connection but never answers:
+    // without it the frame sits blank forever.
+    const slow = setTimeout(() => {
+      if (cancelled) return
+      setPreviewState((s) => (s === 'loading' ? 'unreachable' : s))
+      setPreviewNote((n) => n || 'timed out')
+    }, 12000)
+
+    return () => { cancelled = true; clearTimeout(slow) }
+  }, [previewId, previewSrc, isDevServer])
+
+
+
+
   // Push the previewed app's COMMENTS down to the overlay as pins. The overlay
   // keys a pin by `id`, so each comment's cid becomes its pin id.
   useEffect(() => {
@@ -651,7 +777,7 @@ export default function DesignTweak() {
     const items = []
     for (const req of pending) {
       for (const c of req.comments || []) {
-        if (!(c.previewUrl || '').includes(`/proxy/${previewId}/`)) continue
+        if (!belongsToPreview(c)) continue
         items.push({
           id: c.cid,
           number: `${req.number}.${c.index}`,
@@ -664,7 +790,7 @@ export default function DesignTweak() {
       }
     }
     postToOverlay({ type: 'requests', items })
-  }, [pending, previewId, postToOverlay])
+  }, [pending, previewId, postToOverlay, belongsToPreview])
 
   // Click a comment in the left rail → toggle its pin bubble open/closed.
   const focusComment = useCallback((c) => {
@@ -708,7 +834,7 @@ export default function DesignTweak() {
     for (const req of pending) {
       for (const c of req.comments || []) {
         cur[c.cid] = c.status
-        const belongs = (c.previewUrl || '').includes(`/proxy/${previewId}/`)
+        const belongs = belongsToPreview(c)
         if (belongs && c.status === 'done' && prev && prev[c.cid] && prev[c.cid] !== 'done') {
           doneNow = { label: `${req.number}.${c.index}` }
         }
@@ -719,8 +845,80 @@ export default function DesignTweak() {
       setPreviewNonce(Date.now())     // bump iframe src → reload; pins re-anchor on load
       setStatus(`Preview refreshed — ${doneNow.label} done`)
     }
-  }, [pending, previewId])
+  }, [pending, previewId, belongsToPreview])
 
+
+  // Set or clear the dev-server URL of the project already being previewed.
+  // Registering via the add-form only covers NEW projects; this is how an
+  // existing one gets pointed at a dev server without re-adding its folder.
+  const setDevServer = useCallback(async (url) => {
+    if (!previewId) return
+    try {
+      const out = await api.post(`${API_BASE}/projects/preview-url`, { id: previewId, previewUrl: url })
+      if (out?.error) { setStatus(out.error); return }
+      setDevOpen(false)
+      setDevDraft('')
+      await refresh()
+      setPreviewNonce(Date.now())      // reload the frame at the new target
+      setStatus(url ? `Previewing ${previewProject?.name || 'app'} from ${url}.`
+        : `Previewing ${previewProject?.name || 'app'} from disk.`)
+    } catch (err) { setStatus(`Failed: ${err?.message || err}`) }
+  }, [api, previewId, previewProject, refresh])
+
+  // One click for the common case: find the dev server for THIS project and use
+  // it. Falls back to revealing the input when there is nothing unambiguous.
+  const useDetectedDevServer = useCallback(async () => {
+    if (!previewId) return
+    setDetecting(true)
+    setStatus('Looking for a dev server…')
+    try {
+      const out = await api.get(`${API_BASE}/detect-dev-server?id=${encodeURIComponent(previewId)}`)
+      if (out?.suggested) { await setDevServer(out.suggested); return }
+      if ((out?.candidates || []).length > 1) {
+        setDevOpen(true)
+        setDevDraft(out.candidates[0].url)
+        setStatus(`${out.candidates.length} servers match this folder (${out.candidates.map((c) => c.port).join(', ')}) — pick one.`)
+        return
+      }
+      setDevOpen(true)
+      setStatus('No dev server found for this folder — start it, or type the URL.')
+    } catch (err) { setStatus(`Detect failed: ${err?.message || err}`) }
+    finally { setDetecting(false) }
+  }, [api, previewId, setDevServer])
+
+  // Start this project's own dev server, then preview it. Adopts a server the
+  // user already has running rather than starting a second one.
+  const startDevServer = useCallback(async () => {
+    if (!previewId) return
+    setStarting(true)
+    setDevError('')
+    setStatus(`Starting ${previewProject?.devCommand || 'the dev server'}…`)
+    try {
+      const out = await api.post(`${API_BASE}/dev-server/start?id=${encodeURIComponent(previewId)}`, {})
+      if (!out?.ok) {
+        setDevError(out?.error || 'Could not start the dev server.')
+        setStatus('')
+        return
+      }
+      await refresh()
+      setPreviewNonce(Date.now())
+      setStatus(out.adopted
+        ? `Using the dev server already running at ${out.url}.`
+        : `Dev server running at ${out.url}.`)
+    } catch (err) { setDevError(String(err?.message || err)) }
+    finally { setStarting(false) }
+  }, [api, previewId, previewProject, refresh])
+
+  const stopDevServer = useCallback(async () => {
+    if (!previewId) return
+    try {
+      await api.post(`${API_BASE}/dev-server/stop?id=${encodeURIComponent(previewId)}`, {})
+      setDevError('')
+      await refresh()
+      setPreviewNonce(Date.now())
+      setStatus('Dev server stopped — previewing from disk.')
+    } catch (err) { setStatus(`Stop failed: ${err?.message || err}`) }
+  }, [api, previewId, refresh])
 
   const setEditMode = useCallback((m) => {
     setMode(m)
@@ -821,6 +1019,21 @@ export default function DesignTweak() {
                 },
                   h(Folder, { size: 14, className: 'shrink-0' }),
                   h('span', { className: 'truncate flex-1' }, p.name),
+                  // Tag framework projects: they cannot preview from disk, so the
+                  // tag is what tells you a dev server is part of the deal —
+                  // shown whether or not one is currently running.
+                  (p.needsDevServer || p.previewUrl) && h('span', {
+                    title: p.previewUrl
+                      ? `Previewing from ${p.previewUrl}`
+                      : `Needs a dev server (${p.devCommand || 'no dev script found'})`,
+                    className: 'shrink-0 text-[10px] px-1.5 rounded-full',
+                    style: {
+                      paddingTop: '1px',
+                      paddingBottom: '1px',
+                      color: p.previewUrl ? 'var(--accent)' : 'var(--muted)',
+                      background: p.previewUrl ? 'var(--accent-subtle)' : 'var(--bg-elevated)',
+                    },
+                  }, 'dev'),
                   // Always occupies its 22px, only visibility toggles — a
                   // conditionally-rendered button changed the row's content
                   // width on hover, which shifted the name beside it.
@@ -846,7 +1059,10 @@ export default function DesignTweak() {
                     placeholder: '/Users/you/Developer/my-app',
                     className: 'flex-1 h-8 px-2 rounded-md bg-bg-elevated border border-border text-[12px] text-text',
                   }),
-                  h('button', { onClick: () => addProject(), className: 'h-8 px-3 rounded-md bg-accent text-accent-fg text-[12px] font-bold cursor-pointer' }, 'Add'),
+                  h('button', {
+                    onClick: () => addProject(),
+                    className: 'h-8 px-3 rounded-md bg-accent text-accent-fg text-[12px] font-bold cursor-pointer',
+                  }, 'Add'),
                 )
               : h('button', {
                   onClick: pickFolder,
@@ -942,14 +1158,63 @@ export default function DesignTweak() {
       style: { border: '1px solid var(--border)', borderRadius: '16px', overflow: 'hidden' },
     },
       // upper: preview
-      previewId
-        ? h('div', { className: 'flex-1 min-h-0 flex items-center justify-center p-3' },
+      // A framework project with no dev server running cannot be previewed from
+      // disk at all — its entry script is TypeScript. Rather than frame a page
+      // that is guaranteed to come up blank, say so and offer to start it.
+      previewId && previewProject?.needsDevServer && !previewProject?.previewUrl
+        ? h('div', {
+            className: 'flex-1 min-h-0 flex items-center justify-center p-6',
+          },
+            h('div', {
+              className: 'flex flex-col items-start gap-3',
+              style: { maxWidth: '460px' },
+            },
+              h('div', { className: 'text-[15px] font-bold text-text' },
+                'This is a web app — it needs a dev server'),
+              h('div', { className: 'text-[13px] text-muted leading-snug' },
+                previewProject.unbundledEntry
+                  ? [
+                      'Its entry point is ',
+                      h('code', { key: 'e', className: 'text-text' }, previewProject.unbundledEntry),
+                      ' — TypeScript/JSX, which a browser cannot run. The files have to be built as they are served, so there is nothing to preview from disk.',
+                    ]
+                  : 'There is no HTML entry point to serve from disk, so it has to be built and served by its own dev server.',
+              ),
+              previewProject.devCommand
+                ? h('button', {
+                    onClick: startDevServer,
+                    disabled: starting,
+                    className: 'h-9 px-4 rounded-xl text-[13px] font-bold cursor-pointer disabled:cursor-wait',
+                    style: { background: 'var(--accent)', color: 'var(--accent-fg)', border: 0 },
+                  }, starting ? 'Starting…' : 'Start dev server')
+                : h('div', { className: 'text-[12px]', style: { color: 'var(--warn)' } },
+                    'No dev script found in package.json — start it yourself, then press Dev server below.'),
+              previewProject.devCommand && h('div', { className: 'text-[11px] text-muted' },
+                'Runs ', h('code', { key: 'c', className: 'text-text' }, previewProject.devCommand),
+                ' in ', h('code', { key: 'p', className: 'text-text' }, previewProject.name),
+                '. Hot reload keeps working, and select-to-edit works as usual.'),
+              devError && h('div', {
+                className: 'text-[12px] leading-snug',
+                style: {
+                  color: 'var(--danger)', background: 'var(--danger-subtle)',
+                  padding: '8px 10px', borderRadius: 8, whiteSpace: 'pre-wrap',
+                },
+                role: 'alert',
+              }, devError),
+            ),
+          )
+        : previewId
+        ? h('div', {
+            className: 'flex-1 min-h-0 flex items-center justify-center p-3',
+            style: { position: 'relative' },
+          },
             h('iframe', {
               ref: iframeRef,
-              src: `${API_BASE}/proxy/${previewId}/?_t=${previewNonce}`,
+              src: previewSrc,
               onLoad: () => {
+                markFramed()
                 setEditMode(mode)
-                const items = pending.filter((it) => (it.previewUrl || '').includes(`/proxy/${previewId}/`))
+                const items = pending.filter((it) => belongsToPreview(it))
                 postToOverlay({ type: 'requests', items })
               },
               title: 'preview',
@@ -959,6 +1224,45 @@ export default function DesignTweak() {
               },
               sandbox: 'allow-scripts allow-same-origin allow-forms',
             }),
+
+            // Status layer. Covers the frame while it is blank and explains why,
+            // instead of leaving a white rectangle. The iframe stays mounted
+            // underneath so it can still finish loading and fire onLoad.
+            previewState !== 'ready' && h('div', {
+              style: {
+                position: 'absolute', inset: '12px',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                borderRadius: 8, background: 'var(--panel)', textAlign: 'center',
+                padding: '24px',
+              },
+            },
+              previewState === 'loading'
+                ? h('div', { className: 'flex flex-col items-center gap-2' },
+                    h(RefreshCw, { size: 18, className: 'text-muted animate-spin' }),
+                    h('div', { className: 'text-[13px] text-text' },
+                      `Loading ${previewProject?.name || 'preview'}…`),
+                    isDevServer && h('div', { className: 'text-[12px] text-muted' },
+                      previewProject.previewUrl),
+                  )
+                : h('div', { className: 'flex flex-col items-center gap-2', style: { maxWidth: '420px' } },
+                    h('div', { className: 'text-[13px] font-bold text-text' },
+                      isDevServer ? 'Dev server not reachable' : 'Preview not reachable'),
+                    h('div', { className: 'text-[12px] text-muted leading-snug' },
+                      isDevServer
+                        ? [
+                            'Nothing answered at ',
+                            h('code', { key: 'u', className: 'text-text' }, previewProject.previewUrl),
+                            '. Start the dev server for this project, then retry — or clear its URL to preview the files from disk instead.',
+                          ]
+                        : 'The app backend did not answer. If you just changed it, toggle Design Tweak off and on in the Apps page.'),
+                    previewNote && h('div', { className: 'text-[11px] text-muted' }, `(${previewNote})`),
+                    h('button', {
+                      onClick: () => setPreviewNonce(Date.now()),
+                      className: 'mt-1 h-8 px-3 rounded-md text-[12px] font-bold cursor-pointer',
+                      style: { background: 'var(--accent)', color: 'var(--accent-fg)', border: 0 },
+                    }, 'Retry'),
+                  ),
+            ),
           )
         : h('div', {
             className: 'flex-1 flex items-center justify-center text-muted text-sm text-center',
@@ -972,6 +1276,7 @@ export default function DesignTweak() {
         style: { height: '56px', borderTop: '1px solid var(--border)' },
       },
         // dimensions selector
+        h('div', { className: 'flex items-center gap-1' },
         h('div', { className: 'relative' },
           h('button', {
             onClick: () => setDimsOpen(!dimsOpen),
@@ -992,6 +1297,52 @@ export default function DesignTweak() {
               className: `block w-full text-left px-4 h-9 text-[13px] cursor-pointer hover:bg-bg-elevated ${k === dims ? 'text-text font-bold' : 'text-muted'}`,
             }, k[0].toUpperCase() + k.slice(1) + (k === 'desktop' ? '' : ` (${DIMS[k]})`))),
           ),
+        ),
+
+        // Dev-server control. Sits beside Dimensions because that is where you
+        // are when a preview looks wrong — the add-form only covers new projects.
+        previewId && h('div', { className: 'relative' },
+          previewProject?.previewUrl && !devOpen
+            ? h('div', { className: 'flex items-center gap-1 h-8 pl-2 pr-1 rounded-xl', style: { background: 'var(--accent-subtle)' } },
+                h('span', { className: 'text-[12px]', style: { color: 'var(--accent)' } },
+                  previewProject.previewUrl.replace(/^https?:\/\//, '')),
+                h('button', {
+                  title: 'Preview from disk instead',
+                  onClick: () => setDevServer(''),
+                  className: 'p-1 rounded-md cursor-pointer',
+                  style: { color: 'var(--accent)' },
+                }, h(X, { size: 13 })),
+              )
+            : !devOpen
+              ? h('button', {
+                  onClick: useDetectedDevServer,
+                  disabled: detecting,
+                  title: 'Preview this project from its running dev server (keeps hot reload working)',
+                  className: 'flex items-center gap-2 h-8 px-3 rounded-xl text-[13px] text-muted hover:text-text hover:bg-bg-elevated cursor-pointer disabled:cursor-wait',
+                }, h(Eye, { size: 15 }), detecting ? 'Looking…' : 'Dev server')
+              : h('div', { className: 'flex items-center gap-1' },
+                  h('input', {
+                    value: devDraft, autoFocus: true,
+                    onChange: (e) => setDevDraft(e.target.value),
+                    onKeyDown: (e) => {
+                      if (e.key === 'Enter') setDevServer(devDraft.trim())
+                      if (e.key === 'Escape') { setDevOpen(false); setDevDraft('') }
+                    },
+                    placeholder: 'http://localhost:5173',
+                    className: 'h-8 px-2 rounded-md bg-bg-elevated border border-border text-[12px] text-text',
+                    style: { width: '190px' },
+                  }),
+                  h('button', {
+                    onClick: () => setDevServer(devDraft.trim()),
+                    className: 'h-8 px-2 rounded-md text-[12px] font-bold cursor-pointer',
+                    style: { background: 'var(--accent)', color: 'var(--accent-fg)', border: 0 },
+                  }, 'Use'),
+                  h('button', {
+                    onClick: () => { setDevOpen(false); setDevDraft('') },
+                    className: 'h-8 px-2 rounded-md text-[12px] text-muted hover:text-text cursor-pointer',
+                  }, 'Cancel'),
+                ),
+        ),
         ),
         // refresh + preview/edit toggle
         h('div', { className: 'flex items-center gap-2' },

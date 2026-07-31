@@ -15,8 +15,13 @@ second from the right".
 
 ---
 
-## Features (v0.7.0)
+## Features (v0.8.0)
 
+- **Static sites and framework apps** — a folder that can be served from disk is
+  previewed immediately; one whose entry point is TypeScript/JSX is recognised as
+  a web app, tagged `dev`, and offered a **Start dev server** button. The app runs
+  the project's own dev script, finds the port it chose, and frames it directly so
+  hot reload keeps working. An already-running server is adopted, not duplicated.
 - **Multi-app workspace** — register any number of local web app folders via the
   native macOS folder picker (`+ load new app`). All of them are served
   simultaneously by the app's backend at per-project URLs, so **switching apps in
@@ -104,10 +109,25 @@ and install from the Apps page.
 Works out of the box for static HTML/CSS/JS folders. Projects whose entry point
 isn't a top-level `index.html` are handled too — `public/`, `dist/`, `build/`,
 `app/`, and other common locations are resolved automatically, and if there's no
-entry at all the preview explains what it found instead of failing blank. For
-Vite/React projects you can also point it at a running dev server URL, and
-optionally add the bundled source-mapping plugin for exact `file:line:col`
-targeting (see below).
+entry at all the preview explains what it found instead of failing blank.
+
+**Framework projects (Vite, React Router, Next, …) are detected, not fumbled.** A
+folder whose entry script is TypeScript/JSX cannot be served from disk — the
+browser can't run it, so it would render an empty page. Design Tweak recognises
+that and offers to start the project's own dev server instead:
+
+1. Add the folder as usual. It appears with a `dev` tag.
+2. The preview explains that it needs a dev server and offers **Start dev server**.
+3. That runs the project's own dev script (`npm run dev`, or the pnpm/yarn/bun
+   equivalent from its lockfile), waits for it to listen, and frames it directly —
+   so **hot reload keeps working**, which it cannot behind the static proxy.
+4. Select-to-edit works unchanged. Add `vite-plugin-kiro-source` to that project
+   for exact `file:line:col` targeting (see below).
+
+A dev server you started yourself is adopted rather than duplicated, and stopping
+only ever kills a server Design Tweak started. The port is never forced: the dev
+tool picks its own and the app finds it by matching the listening port back to the
+process, which avoids a per-framework table of port flags.
 
 ## How it works
 
@@ -133,8 +153,13 @@ poke-and-prose/
 ├── plugins/
 │   ├── babel-plugin-kiro-source.js
 │   └── vite-plugin-kiro-source.js ← optional dev-time source mapping for Vite apps
-├── tests/
-│   ├── test_batch_model.py        ← 12 end-to-end checks of the request/comment model
+├── tests/                         ← 9 suites, run them all with tests/run-all.sh
+│   ├── test_batch_model.py        ← the request/comment model, end to end
+│   ├── test_project_classify.py   ← static vs needs-a-dev-server, per lockfile
+│   ├── test_toolchain_path.py     ← finding npm when PATH lacks it
+│   ├── test_bundler_template.py   ← .tsx entry detection (blank-page guard)
+│   ├── test_detect_dev_server.py  ← port → pid → cwd matching
+│   ├── audit_host_classes.py      ← Tailwind classes the host bundle lacks
 │   └── migrate_to_batch.py        ← one-shot migration for pre-0.7.0 queue files
 └── ui/index.mjs                   ← dashboard page (federated ESM, no build step)
 ```

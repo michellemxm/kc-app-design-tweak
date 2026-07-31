@@ -120,8 +120,80 @@ hist = call('/history')['history']
 assert hist and hist[0]['id'] == a['id'] and len(hist[0]['comments']) == 2, hist
 print(f'   -> history has request {hist[0]["number"]} with {len(hist[0]["comments"])} comments')
 
-print('10. an unrecognised `state` must NOT read back as an unsent draft')
-# Regression: an agent wrote state="done" into the file, and the old roll-up did
+
+def cap_raw(text, url, project_id=None, tag='div', source=None):
+    """Capture with an arbitrary previewUrl — models a dev-server page."""
+    el = {'tag': tag, 'classes': ['x'], 'locator': 'body>' + tag}
+    if source:
+        el['source'] = source
+    p = {
+        'type': 'visual_edit_request', 'comment': text, 'previewUrl': url,
+        'selection': {'mode': 'single', 'elements': [el]},
+    }
+    if project_id is not None:
+        p['projectId'] = project_id
+    return call('/submit', p)
+
+
+DEV_URL = 'http://localhost:5173/pricing'
+
+print('10. an explicit projectId identifies a DEV-SERVER capture')
+# The whole point: this URL has no /api/proxy/<id>/ to pattern-match, so
+# without the explicit id the comment would belong to no project at all.
+def find_comment(cid):
+    for r in call('/queue')['pending']:
+        for c in r['comments']:
+            if c['cid'] == cid:
+                return r, c
+    raise AssertionError(f'comment {cid} not found in the queue')
+
+
+d1 = cap_raw('dev server comment', DEV_URL, project_id='proj1')
+req, cm = find_comment(d1['cid'])
+print(f'   -> projectId={cm["projectId"]!r} projectRoot={req["projectRoot"]!r}')
+assert cm['projectId'] == 'proj1', cm
+assert req['projectRoot'] == '/tmp', req      # resolved from the registry, not the URL
+
+print('11. a dev-server route does NOT become a bogus sourceFile')
+# `/pricing` is a route, not a file on disk. Guessing a path here would send the
+# agent to edit something that does not exist.
+print(f'   -> sourceFile={cm["sourceFile"]!r}')
+assert cm['sourceFile'] == '', cm
+
+print('12. a dev-server comment still groups into ITS project\'s draft')
+d2 = cap_raw('second dev comment', DEV_URL, project_id='proj1')
+assert d2['id'] == d1['id'], 'second comment opened a different request'
+print(f'   -> {d1["label"]} and {d2["label"]} share request {d2["number"]}')
+
+print('13. two projects previewed from dev servers do NOT collide')
+server._CFG['projects'].append({'id': 'proj2', 'path': '/tmp', 'name': 'other'})
+d3 = cap_raw('other project', DEV_URL, project_id='proj2')
+assert d3['id'] != d1['id'], 'projects collided into one draft'
+print(f'   -> proj2 opened request {d3["number"]}, separate from {d1["number"]}')
+
+print('14. proxied captures still resolve a real sourceFile (no regression)')
+p1 = cap_raw('proxied', 'http://x/apps/poke-and-prose/api/proxy/proj1/index.html',
+             project_id='proj1')
+_, pc = find_comment(p1['cid'])
+print(f'   -> sourceFile={pc["sourceFile"]!r}')
+assert pc['sourceFile'] == '/tmp/index.html', pc
+
+print('15. a payload with NO projectId still works (pre-change comments)')
+p2 = cap_raw('legacy', 'http://x/apps/poke-and-prose/api/proxy/proj1/about.html')
+_, lc = find_comment(p2['cid'])
+print(f'   -> fell back to the URL: projectId={lc["projectId"]!r}')
+assert lc['projectId'] == 'proj1' and lc['sourceFile'] == '/tmp/about.html', lc
+
+print('16. the per-element source block reaches the agent')
+# This is what makes dev-server projects targetable at all: the Vite plugin's
+# data-kiro-source is resolved in the overlay and must survive to the summary.
+hi = {'file': 'src/Pricing.tsx', 'line': 42, 'column': 6, 'confidence': 'high'}
+s1 = cap_raw('mapped', DEV_URL, project_id='proj1', source=hi)
+_, sc = find_comment(s1['cid'])
+print(f'   -> source={sc["source"]}')
+assert sc['source'] == hi, sc
+
+print('17. an unrecognised `state` must NOT read back as an unsent draft')# Regression: an agent wrote state="done" into the file, and the old roll-up did
 # `if state != "sent": return "draft"` — so a fully-worked request showed the
 # "draft · not sent" badge and a Send bar in the left panel.
 e = cap('badge regression check', 'section', 'hero')
@@ -137,14 +209,14 @@ r = [x for x in call('/queue')['pending'] if x['id'] == eid][0]
 print(f'   raw state={raw["state"]!r} -> reported status={r["status"]!r}')
 assert r['status'] == 'done', f'expected done, got {r["status"]}'
 
-print('11. a worked request can no longer collect new comments')
+print('18. a worked request can no longer collect new comments')
 # Same file, still state="done": a fresh capture must open a NEW request rather
 # than appending to one the agent has already acted on.
 g = cap('should start a new request', 'aside', 'sidebar')
 assert g['id'] != eid, 'capture leaked into an already-worked request'
 print(f'   -> new capture opened request {g["number"]} (not {[x["number"] for x in call("/queue")["pending"] if x["id"] == eid]})')
 
-print('12. progress on a draft normalises state, so the two cannot drift')
+print('19. progress on a draft normalises state, so the two cannot drift')
 hid = g['id']
 post(f'/thread?id={hid}&cid={g["cid"]}', {'role': 'agent', 'text': 'working'})
 raw = json.loads((qdir / f'{hid}.json').read_text())

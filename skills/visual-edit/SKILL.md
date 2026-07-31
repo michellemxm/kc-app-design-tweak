@@ -72,20 +72,26 @@ Every comment carries its own project context stamped by the backend — prefer 
 over searching, and note that comments in one batch can point at **different
 files** (the designer may have navigated between pages mid-batch).
 
-- `projectRoot` (request level) — absolute path to the previewed app's root.
+- `projectId` / `projectRoot` (request level) — which project, and the absolute
+  path to its root.
 - `sourceFile` (per comment) — absolute path to the file that was being previewed
-  when that comment was made. Open this first; the element is in it.
+  when that comment was made. **May be empty**, and that is not an error: it is
+  only set when the preview was a served *file*. A project previewed from its own
+  dev server has routes, not file paths (`/pricing` is not a path on disk), so
+  there is nothing honest to put here.
 
-Then, within that file, use the element's `source` block by confidence:
+**Use the element's own `source` block first — it is the most precise signal, and
+the only one available when `sourceFile` is empty:**
 
 - `confidence: "high"` — `file:line:col` from the build-time plugin. Trust it.
+  Resolve `file` against `projectRoot`.
 - `confidence: "medium"` — framework internal (React Fiber). Verify against `htmlSnippet`.
-- `confidence: "low"` — no source map (plain HTML). Locate the node inside
-  `sourceFile` by its `htmlSnippet`, `classes`, `id`, or text. You already know
-  the file, so this is a search **within one file**, never across the tree.
+- `confidence: "low"` — no source map. If `sourceFile` is set, locate the node
+  inside that one file by `htmlSnippet`, `classes`, `id`, or text. If it is also
+  empty, search `projectRoot` for the snippet and **confirm before editing**.
 
-If `projectRoot` is empty, a dev-server URL (`devServer`) was used instead; fall
-back to the active project directory + `htmlSnippet`.
+If `projectRoot` is empty too, a dev-server URL (`devServer`) was used with no
+registered project; fall back to the active project directory + `htmlSnippet`.
 
 ## Follow-up comments
 
@@ -118,6 +124,7 @@ original's — the original request is finished and must not be mutated.
       "status": "new | sent | done",
       "comment": "increase spacing between these cards",
       "createdAt": "2026-07-29T23:00:00Z",
+      "projectId": "e4b4aa4c",
       "sourceFile": "/Users/me/Developer/my-site/pricing.html",
       "previewUrl": "http://…/api/proxy/e4b4aa4c/pricing.html",
       "followUpTo": "",
