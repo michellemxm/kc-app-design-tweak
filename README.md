@@ -15,13 +15,18 @@ second from the right".
 
 ---
 
-## Features (v0.8.0)
+## Features (v0.9.0)
 
 - **Static sites and framework apps** — a folder that can be served from disk is
   previewed immediately; one whose entry point is TypeScript/JSX is recognised as
   a web app, tagged `dev`, and offered a **Start dev server** button. The app runs
   the project's own dev script, finds the port it chose, and frames it directly so
   hot reload keeps working. An already-running server is adopted, not duplicated.
+- **One app, one body of work** — requests, history and the agent's chat session
+  are all scoped per web app. Switching apps in the dropdown shows only that app's
+  requests, numbered from 1 in its own sequence, and its edit requests land as
+  turns in a chat session dedicated to that folder — so two apps never
+  cross-influence each other's context.
 - **Multi-app workspace** — register any number of local web app folders via the
   native macOS folder picker (`+ load new app`). All of them are served
   simultaneously by the app's backend at per-project URLs, so **switching apps in
@@ -119,25 +124,37 @@ that and offers to start the project's own dev server instead:
 1. Add the folder as usual. It appears with a `dev` tag.
 2. The preview explains that it needs a dev server and offers **Start dev server**.
 3. That runs the project's own dev script (`npm run dev`, or the pnpm/yarn/bun
-   equivalent from its lockfile), waits for it to listen, and frames it directly —
-   so **hot reload keeps working**, which it cannot behind the static proxy.
-4. Select-to-edit works unchanged. Add `vite-plugin-kiro-source` to that project
-   for exact `file:line:col` targeting (see below).
+   equivalent from its lockfile) and waits for it to listen.
+4. The dev server is then framed **through an injecting proxy** on its own port,
+   which adds the select-to-edit overlay to the HTML and relays the hot-reload
+   WebSocket as raw bytes — so **select-to-edit and hot reload both work**, with
+   no change to your project. Add `vite-plugin-kiro-source` for exact
+   `file:line:col` targeting (see below).
 
-A dev server you started yourself is adopted rather than duplicated, and stopping
-only ever kills a server Design Tweak started. The port is never forced: the dev
-tool picks its own and the app finds it by matching the listening port back to the
-process, which avoids a per-framework table of port flags.
+A dev server you started yourself is adopted rather than duplicated (and fronted
+by the same proxy, so select-to-edit works there too); stopping only ever kills a
+server Design Tweak started. The port is never forced: the dev tool picks its own
+and the app finds it by matching the listening port back to the process, which
+avoids a per-framework table of port flags.
+
+The proxy maps paths **1:1 on its own port** rather than sitting under a
+`/proxy/<id>/` prefix. A dev server's HTML refers to root-absolute URLs
+(`/src/main.tsx`, `/@vite/client`) and its client builds more at runtime; behind a
+path prefix every one of them would miss. Identity mapping means nothing needs
+rewriting except the one script tag.
 
 ## How it works
 
 | Concern                | Implementation                                                        |
 |------------------------|-----------------------------------------------------------------------|
-| Preview                | Backend serves each registered folder same-origin at `/proxy/<id>/` (the dashboard CSP is `frame-src 'self'`, so same-origin serving is required) |
+| Preview (static)       | Backend serves each registered folder same-origin at `/proxy/<id>/`, injecting `<base href>` + the overlay |
+| Preview (dev server)   | An injecting reverse proxy on its own ephemeral port, mapping paths 1:1; HTML gains the overlay, WebSocket upgrades are relayed as raw bytes so HMR survives. Its port is resolved live, never persisted — it dies with the backend |
 | Entry resolution       | Folder requests try `index.html`, then common nestings (`public/`, `dist/`, `build/`, `app/`, …); `<base href>` points at the served file's own directory |
 | Selection overlay      | `inject/select-to-edit.js`, auto-injected into served HTML — no manual wiring |
 | Panel ↔ overlay bridge | `window.postMessage` both ways (comments up; mode + theme colors down). A pin's id **is** its comment's `cid` |
 | Request model          | One queue file per *request*, holding many comments as sub-items. Comment statuses are authoritative; the request's status is derived from them |
+| Per-app scoping        | Each request carries `projectId` + `projectRoot`; the panel shows only the previewed app's requests, and numbering is derived per project (not a global counter) |
+| Agent delivery target  | One chat slot per app folder, keyed by a hash of its path — created idempotently and titled explicitly, so a request can never open a second session |
 | Source mapping         | `projectRoot` per request + `sourceFile` per comment, stamped from the serving path; optional `plugins/vite-plugin-kiro-source.js` adds `data-kiro-source="file:line:col"` for framework projects |
 | Delivery into agent    | Batch queued as JSON in the app's data dir; `useChatLauncher().openChat()` hands it to a per-app chat session; the bundled `visual-edit` skill teaches the agent to work a batch and report per comment via `POST /thread?id=…&cid=…` |
 
@@ -153,12 +170,13 @@ poke-and-prose/
 ├── plugins/
 │   ├── babel-plugin-kiro-source.js
 │   └── vite-plugin-kiro-source.js ← optional dev-time source mapping for Vite apps
-├── tests/                         ← 9 suites, run them all with tests/run-all.sh
+├── tests/                         ← 12 suites, run them all with tests/run-all.sh
 │   ├── test_batch_model.py        ← the request/comment model, end to end
 │   ├── test_project_classify.py   ← static vs needs-a-dev-server, per lockfile
 │   ├── test_toolchain_path.py     ← finding npm when PATH lacks it
 │   ├── test_bundler_template.py   ← .tsx entry detection (blank-page guard)
 │   ├── test_detect_dev_server.py  ← port → pid → cwd matching
+│   ├── test_dev_proxy.py          ← overlay injection + transparency + 502s
 │   ├── audit_host_classes.py      ← Tailwind classes the host bundle lacks
 │   └── migrate_to_batch.py        ← one-shot migration for pre-0.7.0 queue files
 └── ui/index.mjs                   ← dashboard page (federated ESM, no build step)
