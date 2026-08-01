@@ -28,6 +28,7 @@
   window.__KIRO_STE_LOADED__ = true;
 
   var CFG = window.__KIRO_STE__ || {};
+  var PAGE_PIN_INSET = 16;   // bottom-left home for an unplaceable pin
   var SNIPPET_MAX = 600;
 
   var state = { active: false, hover: null, selected: null };
@@ -264,6 +265,52 @@
     openThread(d.id);
   }
 
+  // ---- pin anchoring ----
+  //
+  // A pin used to be DELETED the moment its element stopped resolving. That is
+  // exactly backwards for the two most interesting kinds of comment:
+  //
+  //   "delete this"  → the agent removes the node, and the bubble reporting the
+  //                    work disappears with it
+  //   "add a X here" → there is no element yet, so there is nothing to anchor to
+  //
+  // So resolution is a chain, best first, and it never fails. `kind` is returned
+  // so the pin can show HOW firmly it is attached.
+  //
+  //   exact   [data-kiro-cid="<cid>"] — the agent stamped the element it created
+  //           or changed for this comment. Checked FIRST so a re-homed pin wins
+  //           over a stale locator that still matches something else.
+  //   locator the selector captured at comment time
+  //   parent  the element's former parent — for a node that has been removed
+  //   point   where the user clicked, in document space
+  //   page    bottom-left of the page, when even the point is unusable
+  function resolveAnchor(it, existing) {
+    var el = null;
+    // The agent's explicit hand-off always wins, even over a live cached element,
+    // so a pin re-homes onto a newly created node as soon as it appears.
+    try { el = document.querySelector('[data-kiro-cid="' + cssEscape(it.id) + '"]'); } catch (_) { el = null; }
+    if (el) return { el: el, kind: "exact" };
+    if (existing && existing.el && existing.el.isConnected && existing.kind === "locator") {
+      return { el: existing.el, kind: "locator" };
+    }
+    if (it.locator) {
+      try { el = document.querySelector(it.locator); } catch (_) { el = null; }
+      if (el) return { el: el, kind: "locator" };
+    }
+    if (it.parentLocator) {
+      try { el = document.querySelector(it.parentLocator); } catch (_) { el = null; }
+      if (el) return { el: el, kind: "parent" };
+    }
+    if (it.point && typeof it.point.x === "number") return { el: null, kind: "point" };
+    return { el: null, kind: "page" };
+  }
+
+  // CSS.escape is absent in older engines and the ids are hex-ish anyway.
+  function cssEscape(s) {
+    if (window.CSS && CSS.escape) return CSS.escape(String(s));
+    return String(s).replace(/["\\]/g, "\\$&");
+  }
+
   // ---- pins ----
   function reconcile(items) {
     var seen = Object.create(null);
@@ -271,19 +318,15 @@
       var it = items[i];
       if (!it || !it.id) continue;
       seen[it.id] = true;
-      var el = null;
-      var existing = pins[it.id];
-      if (existing && existing.el && existing.el.isConnected) el = existing.el;
-      else if (it.locator) { try { el = document.querySelector(it.locator); } catch (_) { el = null; } }
-      if (!el) { if (existing) removePin(it.id); continue; } // not on this page
-      upsertPin(it, el);
+      var a = resolveAnchor(it, pins[it.id]);
+      upsertPin(it, a.el, a.kind);
     }
     for (var id in pins) if (!seen[id]) removePin(id);
     if (popover && popoverId && pins[popoverId]) maybeRenderThread(pins[popoverId].item);
     repositionPins();
   }
 
-  function upsertPin(item, el) {
+  function upsertPin(item, el, kind) {
     var p = pins[item.id];
     if (!p) {
       var dot = document.createElement("button");
@@ -301,14 +344,23 @@
       dot.addEventListener("mouseenter", function () { dot.style.transform = "scale(1.12)"; });
       dot.addEventListener("mouseleave", function () { dot.style.transform = "scale(1)"; });
       pinLayer.appendChild(dot);
-      p = pins[item.id] = { id: item.id, item: item, el: el, dot: dot };
+      p = pins[item.id] = { id: item.id, item: item, el: el, kind: kind, dot: dot };
     }
     p.item = item;
     p.el = el;
+    p.kind = kind || "locator";
     p.dot.textContent = String(item.number || "•");
     p.dot.style.background = statusColor(item.status);
     p.dot.style.color = readableOn(statusColor(item.status));
-    p.dot.title = "#" + (item.number || "") + " — " + (item.comment || "");
+    // A pin that is not on its own element says so: dashed border, and the tooltip
+    // explains WHY, so a floating bubble never looks like a mispositioned one.
+    var loose = p.kind !== "exact" && p.kind !== "locator";
+    p.dot.style.borderStyle = loose ? "dashed" : "solid";
+    p.dot.style.opacity = loose ? "0.9" : "1";
+    p.dot.title = "#" + (item.number || "") + " — " + (item.comment || "") +
+      (p.kind === "parent" ? "\n(element removed — pinned to its parent)"
+       : p.kind === "point" ? "\n(waiting for the new element — pinned where you commented)"
+       : p.kind === "page" ? "\n(not on this page)" : "");
     positionPin(p);
   }
 
@@ -344,10 +396,38 @@
     return yiq >= 150 ? "#0b0b0b" : "#ffffff";
   }
 
+  // A pin with no element of its own. Two placements:
+  //   point → the document position the user clicked, converted back to viewport
+  //           space so it tracks scrolling like every other pin
+  //   page  → bottom-left of the page, the documented home for a comment that
+  //           cannot be placed at all
+  // Both are clamped into view: an anchor recorded far down a page that has since
+  // got shorter would otherwise put the bubble somewhere unreachable.
+  function positionLoosePin(p) {
+    var pt = p.item && p.item.point;
+    p.dot.style.display = "flex";
+    var left, top;
+    if (p.kind === "point" && pt && typeof pt.x === "number") {
+      left = pt.x - window.scrollX;
+      top = pt.y - window.scrollY;
+    } else {
+      left = PAGE_PIN_INSET;
+      top = window.innerHeight - PAGE_PIN_INSET - 24;
+    }
+    var maxL = Math.max(0, window.innerWidth - 28);
+    var maxT = Math.max(0, window.innerHeight - 28);
+    p.dot.style.left = Math.round(Math.min(Math.max(left, 4), maxL)) + "px";
+    p.dot.style.top = Math.round(Math.min(Math.max(top, 4), maxT)) + "px";
+  }
+
   function positionPin(p) {
-    if (!p.el || !p.el.isConnected) { p.dot.style.display = "none"; return; }
+    // No element: place it from the stored anchor rather than hiding it. Hiding was
+    // the old behaviour and it is what made "delete this" comments disappear.
+    if (!p.el || !p.el.isConnected) return positionLoosePin(p);
     var r = p.el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) { p.dot.style.display = "none"; return; }
+    // A zero-size box is a real element that renders nothing (display:contents, an
+    // emptied container) — fall back rather than hide.
+    if (r.width === 0 && r.height === 0) return positionLoosePin(p);
     p.dot.style.display = "flex";
     p.dot.style.left = Math.round(r.left - 12) + "px";
     p.dot.style.top = Math.round(r.top - 12) + "px";
@@ -355,7 +435,7 @@
 
   function repositionPins() {
     for (var id in pins) positionPin(pins[id]);
-    if (popover && popoverId && pins[popoverId] && pins[popoverId].el) positionFloat(popover, pins[popoverId].el);
+    if (popover && popoverId && pins[popoverId]) positionFloat(popover, pins[popoverId].el || pins[popoverId].dot);
   }
 
   function scrollPinIntoView(p) {
@@ -378,7 +458,7 @@
     popover = mkPanel(340);
     renderThreadBody(p.item);
     document.body.appendChild(popover);
-    positionFloat(popover, p.el);
+    positionFloat(popover, p.el || p.dot);
   }
 
   function closeThread() {
@@ -542,6 +622,13 @@
       id: el.id || "",
       classes: Array.prototype.slice.call(el.classList),
       locator: cssPath(el),
+      // Two extra anchors so a pin can OUTLIVE its element. A comment asking to
+      // delete this node, or to add one that does not exist yet, must not make its
+      // own bubble vanish — that is the moment the comment matters most.
+      //   parentLocator → where the element used to live
+      //   point         → document-space coords of the click, the last resort
+      parentLocator: el.parentElement ? cssPath(el.parentElement) : "",
+      point: { x: Math.round(r.x + window.scrollX), y: Math.round(r.y + window.scrollY) },
       boundingRect: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
       source: source,
       htmlSnippet: html,
