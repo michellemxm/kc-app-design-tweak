@@ -9,7 +9,7 @@ const {
   Send, Plus, Monitor, Eye, Pencil, History: HistoryIcon, X,
 } = window.__kirocrew_modules['lucide-react']
 
-const { useState, useEffect, useCallback, useRef, createElement: h } = React
+const { useState, useEffect, useCallback, useMemo, useRef, createElement: h } = React
 
 // lucide dropped brand icons — inline GitHub mark instead.
 function GithubIcon({ size = 16 }) {
@@ -66,7 +66,10 @@ async function chatApi(url, method, body) {
   })
   if (!r.ok) throw new Error(`chat API ${r.status}`)
   const t = await r.text()
-  return t ? JSON.parse(t) : null
+  // POST /api/chat answers with an SSE STREAM unless ?ws=1 is set, so the body can
+  // legitimately be `data: {...}` rather than JSON. Parsing that threw, and the
+  // throw is what diverted a request into a brand-new ad-hoc chat.
+  try { return t ? JSON.parse(t) : null } catch { return { ok: true, raw: t } }
 }
 
 function timeAgo(iso) {
@@ -280,6 +283,10 @@ export default function DesignTweak() {
   const [devError, setDevError] = useState('')
   const [pending, setPending] = useState([])
   const [history, setHistory] = useState([])
+  // True until the FIRST projects fetch settles. Without it the panel paints
+  // its "no apps registered" empty state during the fetch, so reopening the app
+  // (or a reconnect) reads as "my apps are gone" for a beat.
+  const [booting, setBooting] = useState(true)
   const [histOpen, setHistOpen] = useState(false)
   const [previewId, setPreviewId] = useState('')
   const [previewNonce, setPreviewNonce] = useState(1)
@@ -364,23 +371,30 @@ export default function DesignTweak() {
   // exactly once when a comment for the current app transitions to "done".
   const seenStatusRef = useRef(null)
 
-  // Which per-app chat slots we've already ensured exist (this panel session).
-  const ensuredSlots = useRef(new Set())
+  // Which per-app chat slots we've ensured, mapped to the key the HOST returned
+  // (it normalizes what we ask for, so we must not assume ours survived).
+  const ensuredSlots = useRef(new Map())
   const ensureSlot = useCallback(async (path, label) => {
-    const key = slotKeyFor(path)
-    if (ensuredSlots.current.has(key)) return key
-    let slots = []
-    try { slots = await chatApi('/api/chat/slots', 'GET') } catch { /* ignore */ }
-    const exists = Array.isArray(slots) && slots.some((s) => s.key === key)
-    if (!exists) {
-      await chatApi('/api/chat/slots', 'POST', { name: key, agent: '' })
-      const seed =
-        `Design Tweak session for "${label}". Working directory: ${path}\n` +
-        `You handle visual edit requests for this web app. For each request, edit the ` +
-        `exact source file, then post a one-line summary. Keep responses concise.`
-      try { await chatApi('/api/chat', 'POST', { message: seed, slot: key, agent: '' }) } catch { /* ignore */ }
-    }
-    ensuredSlots.current.add(key)
+    const want = slotKeyFor(path)
+    if (ensuredSlots.current.has(want)) return ensuredSlots.current.get(want)
+    // Slot creation is idempotent: an existing key returns that slot. Listing
+    // first was worse than useless — the list holds only OPEN sessions, so a
+    // closed one read as absent and we tried to create it again. `title` pins
+    // the name so the session can never be auto-titled from a request body.
+    let key = want
+    try {
+      const slot = await chatApi('/api/chat/slots', 'POST',
+        { name: want, agent: '', title: `Design Tweak \u2014 ${label}` })
+      if (slot?.key) key = slot.key
+      if (!slot?.messages?.length) {
+        const seed =
+          `Design Tweak session for "${label}". Working directory: ${path}\n` +
+          `You handle visual edit requests for this web app. For each request, edit the ` +
+          `exact source file, then post a one-line summary. Keep responses concise.`
+        await chatApi('/api/chat?ws=1', 'POST', { message: seed, slot: key, agent: '' })
+      }
+    } catch { /* the send below creates the slot on demand anyway */ }
+    ensuredSlots.current.set(want, key)
     return key
   }, [])
 
@@ -448,6 +462,9 @@ export default function DesignTweak() {
       const hh = await api.get(`${API_BASE}/history`)
       setHistory(Array.isArray(hh?.history) ? hh.history : [])
     } catch { /* ignore */ }
+    // Settled either way: a failed fetch is an answer too, and staying in the
+    // loading state forever would be worse than showing the empty state.
+    setBooting(false)
   }, [api])
 
   useEffect(() => {
@@ -583,19 +600,19 @@ export default function DesignTweak() {
       const proj = projects.find((p) => p.id === previewId)
       const path = req.projectRoot || proj?.path || ''
       const label = proj?.name || 'app'
-      try {
-        if (path) {
-          const key = await ensureSlot(path, label)
-          await chatApi('/api/chat', 'POST', { message: msg, slot: key, agent: '' })
-          setStatus(`Sent Request ${req.number} (${comments.length}) → ${label} session.`)
-        } else {
-          openChat({ message: msg })
-          setStatus(`Sent Request ${req.number} to the agent.`)
-        }
-      } catch {
-        // Chat API unreachable → fall back to the host's active session.
-        openChat({ message: msg })
-        setStatus(`Sent Request ${req.number} (fallback).`)
+      // ?ws=1 makes the host answer with JSON; without it the reply is an SSE
+      // stream, and the parse error used to be caught and "recovered" by opening a
+      // NEW ad-hoc chat — so one request produced two sessions and the app's own
+      // per-app session was bypassed. There is deliberately no fallback now: the
+      // request is already sealed server-side by /send, so silently dispatching it
+      // somewhere else is worse than reporting that it did not go.
+      const key = path ? await ensureSlot(path, label) : ''
+      if (key) {
+        await chatApi('/api/chat?ws=1', 'POST', { message: msg, slot: key, agent: '' })
+        setStatus(`Sent Request ${req.number} (${comments.length}) → ${label} session.`)
+      } else {
+        openChat({ message: msg })          // no folder known — nothing to key a session on
+        setStatus(`Sent Request ${req.number} to the agent.`)
       }
       refresh()
     } catch (err) {
@@ -619,7 +636,7 @@ export default function DesignTweak() {
           // Stamp the project explicitly. The overlay only knows its own page
           // URL, and the backend can only infer a project from a URL it proxies
           // — so the panel, which knows exactly what it is previewing, says so.
-          const out = await api.post(`${API_BASE}/submit`, { ...d.payload, projectId: previewId })
+          const out = await api.post(`${API_BASE}/submit`, { ...d.payload, projectId: previewIdRef.current })
           if (out?.ok) {
             postToOverlay({
               type: 'created', clientRef: d.clientRef,
@@ -647,7 +664,7 @@ export default function DesignTweak() {
             type: 'visual_edit_request',
             comment: d.text,
             followUpTo: d.id,
-            projectId: previewId,
+            projectId: previewIdRef.current,
             previewUrl: origin.comment.previewUrl,
             selection: { mode: 'single', elements: [{ locator: origin.comment.locator }] },
           })
@@ -664,6 +681,14 @@ export default function DesignTweak() {
     return () => window.removeEventListener('message', onMsg)
   }, [api, postToOverlay, summarizeEl, refresh])
 
+  // The capture listener below is registered once and lives for the session, so
+  // it cannot close over `previewId` — it would capture '' forever and stamp every
+  // comment with an empty projectId. A ref is read at call time instead.
+  const previewIdRef = useRef(previewId)
+  useEffect(() => { previewIdRef.current = previewId }, [previewId])
+
+  const previewProject = projects.find((p) => p.id === previewId)
+
   // Does a comment belong to the project currently in the preview?
   //
   // Matches on the explicit projectId the backend stamps at capture time. The
@@ -674,14 +699,30 @@ export default function DesignTweak() {
   const belongsToPreview = useCallback((c) => {
     if (!previewId) return false
     if (c?.projectId) return c.projectId === previewId
+    // projectRoot is checked BEFORE the URL, because it is the field that stayed
+    // correct when projectId did not. Requests captured while the panel held a
+    // stale empty previewId have projectId:"" but the right folder — matching on
+    // the folder recovers them with no migration of live data.
+    const root = previewProject?.path
+    if (root && c?.projectRoot) return c.projectRoot === root
+    // Last resort, and only ever true for a URL this backend proxies: a project
+    // framed from its dev server has no /proxy/<id>/ segment at all.
     return (c?.previewUrl || '').includes(`/proxy/${previewId}/`)
-  }, [previewId])
+  }, [previewId, previewProject])
+
+  // Requests and history are scoped to the app in the preview. Each web app is a
+  // separate body of work with its own dedicated chat session, so mixing them in
+  // one list invites sending app A's comment while looking at app B — and makes
+  // the panel read as someone else's backlog the moment you switch.
+  const myPending = useMemo(
+    () => pending.filter((r) => belongsToPreview(r)), [pending, belongsToPreview])
+  const myHistory = useMemo(
+    () => history.filter((r) => belongsToPreview(r)), [history, belongsToPreview])
 
   // Where the preview iframe points. A project with a dev-server URL is framed
-  // DIRECTLY at it — going through our proxy would work for plain GETs but kill
-  // HMR, since this backend cannot upgrade a WebSocket. Everything else is
-  // proxied from disk as before. The nonce is the reload lever in both cases.
-  const previewProject = projects.find((p) => p.id === previewId)
+  // through the overlay-injecting proxy on that URL (the backend resolves it live
+  // and hands it back as previewUrl); everything else is proxied from disk. The
+  // nonce is the reload lever in both cases.
   const previewSrc = previewProject?.previewUrl
     ? `${previewProject.previewUrl}${previewProject.previewUrl.includes('?') ? '&' : '?'}_t=${previewNonce}`
     : `${API_BASE}/proxy/${previewId}/?_t=${previewNonce}`
@@ -772,12 +813,16 @@ export default function DesignTweak() {
 
   // Push the previewed app's COMMENTS down to the overlay as pins. The overlay
   // keys a pin by `id`, so each comment's cid becomes its pin id.
-  useEffect(() => {
-    if (!previewId) return
+  //
+  // Scoped by REQUEST, not by comment: a request belongs to exactly one project by
+  // construction, and it carries projectRoot — which comments do not. Filtering
+  // per comment therefore dropped every comment of a request whose projectId was
+  // written empty, which is precisely the dev-server case, and an empty list makes
+  // the overlay remove all pins.
+  const pinItems = useMemo(() => {
     const items = []
-    for (const req of pending) {
+    for (const req of myPending) {
       for (const c of req.comments || []) {
-        if (!belongsToPreview(c)) continue
         items.push({
           id: c.cid,
           number: `${req.number}.${c.index}`,
@@ -789,8 +834,13 @@ export default function DesignTweak() {
         })
       }
     }
-    postToOverlay({ type: 'requests', items })
-  }, [pending, previewId, postToOverlay, belongsToPreview])
+    return items
+  }, [myPending])
+
+  useEffect(() => {
+    if (!previewId) return
+    postToOverlay({ type: 'requests', items: pinItems })
+  }, [pinItems, previewId, postToOverlay])
 
   // Click a comment in the left rail → toggle its pin bubble open/closed.
   const focusComment = useCallback((c) => {
@@ -902,9 +952,12 @@ export default function DesignTweak() {
       }
       await refresh()
       setPreviewNonce(Date.now())
+      // Report the DEV server's own address, not the injecting proxy's ephemeral
+      // port — 5173 is the number the user recognises and can open themselves.
+      const shown = out.devUrl || out.url
       setStatus(out.adopted
-        ? `Using the dev server already running at ${out.url}.`
-        : `Dev server running at ${out.url}.`)
+        ? `Using the dev server already running at ${shown}.`
+        : `Dev server running at ${shown}.`)
     } catch (err) { setDevError(String(err?.message || err)) }
     finally { setStarting(false) }
   }, [api, previewId, previewProject, refresh])
@@ -1008,7 +1061,10 @@ export default function DesignTweak() {
           },
           // scrollable list: 4.5 items visible (item ≈ 40px → 180px)
           h('div', { style: { maxHeight: '180px', overflowY: 'auto' } },
-            projects.length === 0
+            booting && projects.length === 0
+              ? h('div', { className: 'px-3 py-3 flex items-center gap-2 text-[13px] text-muted' },
+                  h(RefreshCw, { size: 13, className: 'animate-spin' }), 'Loading…')
+              : projects.length === 0
               ? h('div', { className: 'px-3 py-3 text-[13px] text-muted' }, 'No web apps loaded yet.')
               : projects.map((p) => h('div', {
                   key: p.id,
@@ -1093,10 +1149,15 @@ export default function DesignTweak() {
       h('div', { className: 'flex-1 min-h-0 flex flex-col' },
         // request groups, newest first (scrolls independently)
         h('div', { className: 'flex-1 min-h-0 overflow-y-auto px-2' },
-          pending.length === 0
+          booting
+            ? h('div', { className: 'py-6 px-3 flex items-center gap-2 text-[13px] text-muted' },
+                h(RefreshCw, { size: 14, className: 'animate-spin' }), 'Loading your apps…')
+            : myPending.length === 0
             ? h('div', { className: 'py-6 px-3 text-[13px] text-muted' },
-                'No edit requests yet. Connect a web app, switch the preview to Edit mode, right-click an element, and describe the change. Comments collect into a request — send them as one batch when you\'re done.')
-            : withFollowUpLabels(pending).slice().reverse().map((req) =>
+                !previewId
+                  ? 'No web app connected. Pick one in the dropdown above — each app keeps its own requests, history, and chat session.'
+                  : `No edit requests for ${previewProject?.name || 'this app'} yet. Switch the preview to Edit mode, right-click an element, and describe the change. Comments collect into a request — send them as one batch when you're done.`)
+            : withFollowUpLabels(myPending).slice().reverse().map((req) =>
                 h(RequestGroup, {
                   key: req.id, req, done: false,
                   open: reqOpen[req.id] !== false,   // expanded by default
@@ -1117,11 +1178,11 @@ export default function DesignTweak() {
 
       // History — pinned to the bottom, expands UPWARD when opened
       h('div', { className: 'shrink-0 border-t border-border' },
-        histOpen && history.length > 0 && h('div', {
+        histOpen && myHistory.length > 0 && h('div', {
           className: 'overflow-y-auto px-2 border-b border-border/60',
           style: { maxHeight: '38vh' },
         },
-          withFollowUpLabels(history).map((req) =>
+          withFollowUpLabels(myHistory).map((req) =>
             h(RequestGroup, {
               key: req.id, req, done: true,
               open: reqOpen[req.id] === true,        // collapsed by default
@@ -1138,7 +1199,7 @@ export default function DesignTweak() {
         },
           h(histOpen ? ChevronDown : ChevronRight, { size: 16, className: 'text-muted' }),
           h(HistoryIcon, { size: 15, className: 'text-muted' }), 'History',
-          h('span', { className: 'text-[12px] text-muted font-normal' }, `(${history.length})`),
+          h('span', { className: 'text-[12px] text-muted font-normal' }, `(${myHistory.length})`),
         ),
         ),
       ),
@@ -1214,8 +1275,7 @@ export default function DesignTweak() {
               onLoad: () => {
                 markFramed()
                 setEditMode(mode)
-                const items = pending.filter((it) => belongsToPreview(it))
-                postToOverlay({ type: 'requests', items })
+                postToOverlay({ type: 'requests', items: pinItems })
               },
               title: 'preview',
               style: {
@@ -1268,7 +1328,11 @@ export default function DesignTweak() {
             className: 'flex-1 flex items-center justify-center text-muted text-sm text-center',
             style: { paddingLeft: '40px', paddingRight: '40px' },   // px-10 is not in the host bundle
           },
-            'No web app selected. Pick one in the dropdown — switching is instant.'),
+            booting
+              ? h('div', { className: 'flex flex-col items-center gap-2' },
+                  h(RefreshCw, { size: 18, className: 'animate-spin' }),
+                  h('div', null, 'Looking for your connected apps…'))
+              : 'No web app selected. Pick one in the dropdown — switching is instant.'),
 
       // bottom: action bar (fixed, 56px — 40px tab pill + 8px gap to each bar edge; matches History header)
       h('div', {

@@ -144,10 +144,33 @@ def _active_project() -> dict | None:
     return None
 
 
-def _next_number() -> int:
-    _CFG["counter"] = int(_CFG.get("counter", 0)) + 1
-    _save_cfg(_CFG)
-    return _CFG["counter"]
+def _next_number(project_id: str = "") -> int:
+    """The next request number **within one project**.
+
+    Numbering is per-app so each web app reads as its own sequence: app B's first
+    request is "Request 1", not "Request 7" because six unrelated requests were
+    filed against app A. Derived by scanning, not stored — a stored per-project
+    counter would be a second source of truth to keep in sync, and the request
+    files already know their own numbers.
+
+    Falls back to the legacy global counter when there is no project id, so
+    pre-0.9 requests and any unscoped caller keep working.
+    """
+    if not project_id:
+        _CFG["counter"] = int(_CFG.get("counter", 0)) + 1
+        _save_cfg(_CFG)
+        return _CFG["counter"]
+    highest = 0
+    for d in (QUEUE_DIR, HANDLED_DIR):
+        for fp in d.glob("*.json"):
+            req = _read_request(fp)
+            if not req or req.get("projectId") != project_id:
+                continue
+            try:
+                highest = max(highest, int(req.get("number") or 0))
+            except (TypeError, ValueError):
+                continue
+    return highest + 1
 
 
 def _new_id() -> str:
@@ -573,7 +596,10 @@ def _stop_dev_proc(project_id: str) -> bool:
     rec = _DEV_PROCS.pop(project_id, None)
     if not rec:
         return False
-    proc, pgid = rec["proc"], rec.get("pgid")
+    _stop_inject_proxy(rec)
+    proc, pgid = rec.get("proc"), rec.get("pgid")
+    if proc is None:                  # adopted server: proxy was ours, process is not
+        return True
     try:
         if pgid:
             os.killpg(pgid, signal.SIGTERM)
@@ -602,7 +628,233 @@ atexit.register(_stop_all_dev_procs)
 
 def _dev_proc_alive(project_id: str) -> bool:
     rec = _DEV_PROCS.get(project_id)
-    return bool(rec and rec["proc"].poll() is None)
+    if not rec:
+        return False
+    proc = rec.get("proc")
+    if proc is None:                    # adopted: the user's server, our proxy
+        return bool(rec.get("proxy"))
+    return proc.poll() is None
+
+
+# ---------------------------------------------------------------------------
+# Injecting reverse proxy for dev servers
+#
+# The overlay is what makes select-to-edit work, and it is injected by THIS
+# backend when it serves a folder from disk. Point the iframe straight at a dev
+# server and the overlay never loads — Vite serves its own index.html, and no
+# amount of postMessage plumbing helps because there is nothing in the page to
+# talk to. Framing the dev server directly preserved hot reload and silently
+# dropped the app's entire reason for existing.
+#
+# So a dev server is framed THROUGH a proxy that injects the overlay. Two
+# decisions make this robust rather than a URL-rewriting game:
+#
+#   • It listens on its OWN port and maps paths 1:1. A dev server's HTML refers
+#     to root-absolute URLs (/src/main.tsx, /@vite/client) and its client builds
+#     more at runtime; behind a /proxy/<id>/ path prefix every one of them would
+#     miss. Identity mapping means nothing needs rewriting but the script tag.
+#   • WebSocket upgrades are relayed as raw bytes, so hot reload keeps working.
+#     Once the handshake is done a WS connection is just a byte stream — we never
+#     parse a frame, and the accept key is computed by the dev server, not us.
+# ---------------------------------------------------------------------------
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade",
+}
+# Served by the proxy itself, so the overlay needs no cross-origin fetch and no
+# knowledge of which port this backend is on.
+_OVERLAY_PATH = "/__kiro_select_to_edit__.js"
+_WS_IDLE = 3600            # a quiet HMR socket is normal; don't tear it down
+_RELAY_TIMEOUT = 30
+
+
+class _DevProxyHandler(BaseHTTPRequestHandler):
+    """Byte-transparent reverse proxy, except HTML gains the overlay script."""
+
+    protocol_version = "HTTP/1.1"
+    upstream_host = "127.0.0.1"
+    upstream_port = 0
+
+    def log_message(self, *args) -> None:
+        pass
+
+    def _upstream(self) -> str:
+        return f"{self.upstream_host}:{self.upstream_port}"
+
+    def _dispatch(self) -> None:
+        if self.path.split("?", 1)[0] == _OVERLAY_PATH:
+            return self._serve_overlay()
+        if "websocket" in self.headers.get("Upgrade", "").lower():
+            return self._relay_ws()
+        return self._relay_http()
+
+    do_GET = _dispatch
+    do_POST = _dispatch
+    do_HEAD = _dispatch
+    do_PUT = _dispatch
+    do_PATCH = _dispatch
+    do_DELETE = _dispatch
+    do_OPTIONS = _dispatch
+
+    def _serve_overlay(self) -> None:
+        try:
+            js = INJECT_FILE.read_bytes()
+        except OSError:
+            js = b"// overlay not found"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/javascript; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(js)))
+        self.end_headers()
+        self.wfile.write(js)
+
+    def _relay_http(self) -> None:
+        import http.client
+
+        body = b""
+        length = self.headers.get("Content-Length")
+        if length:
+            try:
+                body = self.rfile.read(int(length))
+            except (ValueError, OSError):
+                body = b""
+
+        headers = {}
+        for key, value in self.headers.items():
+            low = key.lower()
+            # Accept-Encoding is dropped so the upstream answers in identity
+            # encoding — otherwise the HTML would arrive gzipped and the overlay
+            # tag could not be inserted without decompressing it first.
+            if low in _HOP_BY_HOP or low in ("accept-encoding", "host"):
+                continue
+            headers[key] = value
+        headers["Host"] = self._upstream()
+
+        try:
+            conn = http.client.HTTPConnection(
+                self.upstream_host, self.upstream_port, timeout=_RELAY_TIMEOUT)
+            conn.request(self.command, self.path, body=body or None, headers=headers)
+            resp = conn.getresponse()
+            payload = resp.read()
+        except (OSError, http.client.HTTPException) as exc:
+            self.send_error(502, f"dev server unreachable: {exc}")
+            return
+
+        if "text/html" in (resp.getheader("Content-Type") or "").lower():
+            payload = _rewrite_html(payload, base=None, script=_OVERLAY_PATH)
+
+        self.send_response(resp.status)
+        for key, value in resp.getheaders():
+            if key.lower() in _HOP_BY_HOP or key.lower() == "content-length":
+                continue
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(payload)
+        conn.close()
+
+    def _relay_ws(self) -> None:
+        import selectors
+        import socket
+
+        try:
+            up = socket.create_connection(
+                (self.upstream_host, self.upstream_port), timeout=10)
+        except OSError:
+            self.send_error(502, "dev server unreachable")
+            return
+
+        # Replay the handshake verbatim; the upstream's 101 comes back through the
+        # byte pump below, so we never compute Sec-WebSocket-Accept ourselves.
+        lines = [f"{self.command} {self.path} HTTP/1.1"]
+        for key, value in self.headers.items():
+            lines.append(f"{key}: {self._upstream() if key.lower() == 'host' else value}")
+        try:
+            up.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace"))
+        except OSError:
+            up.close()
+            return
+
+        self.close_connection = True
+        down = self.connection
+        up.settimeout(None)
+        down.settimeout(None)
+        sel = selectors.DefaultSelector()
+        sel.register(up, selectors.EVENT_READ, down)
+        sel.register(down, selectors.EVENT_READ, up)
+        try:
+            while True:
+                events = sel.select(timeout=_WS_IDLE)
+                if not events:
+                    return                                  # idle past the cap
+                for key, _mask in events:
+                    try:
+                        chunk = key.fileobj.recv(65536)
+                    except OSError:
+                        return
+                    if not chunk:
+                        return                              # either side hung up
+                    try:
+                        key.data.sendall(chunk)
+                    except OSError:
+                        return
+        finally:
+            sel.close()
+            try:
+                up.close()
+            except OSError:
+                pass
+
+
+def _start_inject_proxy(dev_url: str) -> tuple[object | None, str]:
+    """Front `dev_url` with an overlay-injecting proxy. Returns (server, url)."""
+    parsed = urlparse(dev_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    bound = type("_BoundDevProxy", (_DevProxyHandler,),
+                 {"upstream_host": host, "upstream_port": port})
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), bound)
+    except OSError:
+        return None, ""
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="kiro-dev-proxy").start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}/"
+
+
+def _stop_inject_proxy(rec: dict) -> None:
+    srv = rec.get("proxy")
+    if srv is None:
+        return
+    try:
+        srv.shutdown()
+        srv.server_close()
+    except Exception:                                       # noqa: BLE001
+        pass
+    rec["proxy"] = None
+
+
+def _front_with_proxy(project_id: str, dev_url: str) -> str:
+    """Attach an injecting proxy to a running dev server; return the URL to frame.
+
+    Falls back to the bare dev URL if the proxy cannot be started — a preview
+    without select-to-edit is still better than no preview, and the caller
+    surfaces the difference.
+    """
+    rec = _DEV_PROCS.get(project_id)
+    srv, url = _start_inject_proxy(dev_url)
+    if not url:
+        return dev_url
+    if rec is not None:
+        _stop_inject_proxy(rec)
+        rec["proxy"] = srv
+        rec["proxyUrl"] = url
+    else:
+        _DEV_PROCS[project_id] = {"proc": None, "pgid": None, "url": dev_url,
+                                  "proxy": srv, "proxyUrl": url, "adopted": True}
+    return url
 
 
 def _start_dev_proc(project_id: str, root: Path) -> dict:
@@ -617,7 +869,9 @@ def _start_dev_proc(project_id: str, root: Path) -> dict:
     """
     import subprocess
     if _dev_proc_alive(project_id):
-        return {"ok": True, "url": _DEV_PROCS[project_id]["url"], "already": True}
+        rec = _DEV_PROCS[project_id]
+        return {"ok": True, "url": rec.get("proxyUrl") or rec["url"],
+                "devUrl": rec["url"], "already": True}
     _stop_dev_proc(project_id)                    # clear a dead record
 
     cmd = _dev_command(root)
@@ -658,7 +912,8 @@ def _start_dev_proc(project_id: str, root: Path) -> dict:
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = None
-    _DEV_PROCS[project_id] = {"proc": proc, "pgid": pgid, "url": "", "log": str(log)}
+    _DEV_PROCS[project_id] = {"proc": proc, "pgid": pgid, "url": "",
+                              "log": str(log), "proxy": None, "proxyUrl": ""}
 
     # Poll for the port it chose. Probing is skipped while polling: an HTTP request
     # per candidate per tick is wasteful, and a dev server that is listening but
@@ -677,7 +932,11 @@ def _start_dev_proc(project_id: str, root: Path) -> dict:
         for cand in _detect_dev_servers(root, probe=False):
             if cand["pid"] == proc.pid or (pgid and _same_group(cand["pid"], pgid)):
                 _DEV_PROCS[project_id]["url"] = cand["url"]
-                return {"ok": True, "url": cand["url"], "port": cand["port"]}
+                # Frame the PROXY, not the dev server: the proxy is what injects
+                # the select-to-edit overlay.
+                framed = _front_with_proxy(project_id, cand["url"])
+                return {"ok": True, "url": framed, "devUrl": cand["url"],
+                        "port": cand["port"], "injected": framed != cand["url"]}
         time.sleep(0.4)
 
     _stop_dev_proc(project_id)
@@ -913,23 +1172,28 @@ def _scan_html(root: Path, limit: int = 40, max_depth: int = 3) -> list[str]:
     return found
 
 
-def _rewrite_html(body: bytes, base: str = PROXY_PUBLIC_BASE) -> bytes:
-    """Inject <base> (so relative assets resolve back through the proxy) and the
-    Select-to-Edit overlay script (so no manual wiring is needed)."""
+def _rewrite_html(body: bytes, base: str | None = PROXY_PUBLIC_BASE,
+                  script: str = INJECT_PUBLIC) -> bytes:
+    """Inject the Select-to-Edit overlay, and optionally a <base> tag.
+
+    `base=None` is for the dev-server proxy, which maps paths 1:1 and so needs no
+    <base> — adding one there would repoint every relative URL and break the page.
+    """
     try:
         html = body.decode("utf-8", "replace")
     except (UnicodeDecodeError, AttributeError):
         return body
-    base_tag = f'<base href="{base}">'
-    inject_tag = f'<script src="{INJECT_PUBLIC}"></script>'
-    low = html.lower()
-    head = low.find("<head")
-    if head != -1:
-        end = low.find(">", head)
-        if end != -1:
-            html = html[: end + 1] + base_tag + html[end + 1 :]
-    else:
-        html = base_tag + html
+    inject_tag = f'<script src="{script}"></script>'
+    if base is not None:
+        base_tag = f'<base href="{base}">'
+        low = html.lower()
+        head = low.find("<head")
+        if head != -1:
+            end = low.find(">", head)
+            if end != -1:
+                html = html[: end + 1] + base_tag + html[end + 1 :]
+        else:
+            html = base_tag + html
     bidx = html.lower().rfind("</body>")
     if bidx != -1:
         html = html[:bidx] + inject_tag + html[bidx:]
@@ -1080,7 +1344,7 @@ class Handler(BaseHTTPRequestHandler):
             req = {
                 "type": "visual_edit_batch",
                 "id": rid,
-                "number": _next_number(),
+                "number": _next_number(project_id),
                 "state": "draft",
                 "projectId": project_id,
                 "projectRoot": project_root,
@@ -1255,6 +1519,13 @@ class Handler(BaseHTTPRequestHandler):
                 "unbundledEntry": "", "hasEntry": False,
             })
             row["devRunning"] = _dev_proc_alive(p["id"])
+            # The injecting proxy's port is ephemeral: it lives and dies with this
+            # backend, so it is resolved live here rather than persisted. A saved
+            # port would be guaranteed dead after a restart.
+            live = _DEV_PROCS.get(p["id"]) or {}
+            if live.get("proxyUrl"):
+                row["previewUrl"] = live["proxyUrl"]
+                row["devUrl"] = live.get("url", "")
             out.append(row)
         return self._json(200, {
             "projects": out,
@@ -1278,16 +1549,21 @@ class Handler(BaseHTTPRequestHandler):
         # rather than starting a second one on another port.
         adopted = _auto_dev_server(root)
         if adopted:
-            proj["previewUrl"] = adopted
-            _save_cfg(_CFG)
-            return self._json(200, {"ok": True, "url": adopted, "adopted": True,
+            # Front it with the injecting proxy as well — a server the user started
+            # serves its own HTML, so without this the overlay never loads and
+            # select-to-edit is missing on exactly the projects that need it most.
+            framed = _front_with_proxy(pid, adopted)
+            # NOT persisted: the proxy port dies with this backend, so a saved URL
+            # is guaranteed dead after a restart. _h_projects_list resolves the live
+            # one per request instead.
+            return self._json(200, {"ok": True, "url": framed, "devUrl": adopted,
+                                    "adopted": True, "injected": framed != adopted,
                                     "project": proj})
 
         res = _start_dev_proc(pid, root)
         if not res.get("ok"):
             return self._json(200, res)          # 200: the error text IS the answer
-        proj["previewUrl"] = res["url"]
-        _save_cfg(_CFG)
+        # Likewise not persisted — see above.
         return self._json(200, {**res, "project": proj})
 
     def _h_dev_server_stop(self, qs: dict) -> None:
