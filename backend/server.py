@@ -251,6 +251,10 @@ def _summarize_comment(c: dict) -> dict:
         "createdAt": c.get("createdAt", ""),
         "element": _el_name(el),
         "locator": el.get("locator", ""),
+        # Fallback anchors, so a pin survives its element being deleted (parent) or
+        # not existing yet (point). The overlay tries them in that order.
+        "parentLocator": el.get("parentLocator", ""),
+        "point": el.get("point") or {},
         "count": len(elements),
         "mode": sel.get("mode", "single"),
         "previewUrl": c.get("previewUrl", ""),

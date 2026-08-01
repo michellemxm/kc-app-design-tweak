@@ -830,6 +830,8 @@ export default function DesignTweak() {
           comment: c.comment,
           element: c.element,
           locator: c.locator,
+          parentLocator: c.parentLocator,   // element deleted → pin to where it was
+          point: c.point,                   // element not created yet → pin to the click
           thread: c.thread || [],
         })
       }

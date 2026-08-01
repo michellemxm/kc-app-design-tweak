@@ -104,6 +104,35 @@ phrased as a delta ("actually make it 32px"), so it only makes sense against wha
 was already done. Report the follow-up against its **own** `cid`, not the
 original's — the original request is finished and must not be mutated.
 
+## Comments that ADD or DELETE an element — stamp `data-kiro-cid`
+
+A comment's pin is anchored to the element it was filed against. Two kinds of
+comment break that anchor, and both need one extra step from you.
+
+**When your change CREATES the element the comment asked for**, put the comment's
+`cid` on it:
+
+```html
+<!-- comment 4.2: "add a Cancel button next to Save" -->
+<button data-kiro-cid="c-8f2a91" class="btn-secondary">Cancel</button>
+```
+
+The overlay looks for `[data-kiro-cid="<cid>"]` **before** anything else, so the
+pin leaves the placeholder position it was floating at and re-homes onto the real
+element as soon as the preview reloads. Without the attribute the bubble stays
+stranded where the user clicked, pointing at nothing.
+
+Stamp exactly **one** element per cid — the outermost node you created for it. If
+a comment asked for several elements, stamp the container.
+
+**When your change DELETES an element**, do nothing extra. The pin falls back to
+that element's former parent on its own. Do not stamp a sibling to "keep the pin
+alive" — a bubble on the wrong element is worse than one on the parent.
+
+Leave the attribute in place. It is a durable link between the source and the
+comment that produced it, the same role `data-kiro-source` plays, and it is what
+lets the pin survive later reloads. Only remove one if the user asks.
+
 ## Request schema
 
 ```json

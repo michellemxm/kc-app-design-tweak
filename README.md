@@ -15,7 +15,7 @@ second from the right".
 
 ---
 
-## Features (v0.9.0)
+## Features (v0.10.0)
 
 - **Static sites and framework apps** — a folder that can be served from disk is
   previewed immediately; one whose entry point is TypeScript/JSX is recognised as
@@ -41,6 +41,13 @@ second from the right".
   as one request**. Each comment carries `projectRoot` and `sourceFile`, so the
   agent edits the right file without searching — and a batch may span several
   pages of the same app.
+- **Pins that outlive their element** — a comment asking to *delete* something
+  keeps its bubble: the pin falls back to the removed element's parent, then to
+  where you clicked, then to the page's bottom-left, so it is never silently
+  dropped. A comment asking to *add* something starts as a floating pin at the
+  click point and **re-homes onto the new element** once the agent stamps it with
+  `data-kiro-cid`. A pin that isn't on its own element is drawn dashed and says
+  why in its tooltip.
 - **Per-comment progress** — every comment has its own status dot
   (`new` → `in progress` → `done`) and its own thread bubble, both in the left
   panel and on its in-preview pin. The request header rolls them up ("1 of 3
@@ -151,6 +158,7 @@ rewriting except the one script tag.
 | Preview (dev server)   | An injecting reverse proxy on its own ephemeral port, mapping paths 1:1; HTML gains the overlay, WebSocket upgrades are relayed as raw bytes so HMR survives. Its port is resolved live, never persisted — it dies with the backend |
 | Entry resolution       | Folder requests try `index.html`, then common nestings (`public/`, `dist/`, `build/`, `app/`, …); `<base href>` points at the served file's own directory |
 | Selection overlay      | `inject/select-to-edit.js`, auto-injected into served HTML — no manual wiring |
+| Pin anchoring          | A chain, best first: `[data-kiro-cid]` stamped by the agent → the captured CSS locator → the element's former parent → the click point → page bottom-left. It never fails, so a pin is never deleted for failing to resolve |
 | Panel ↔ overlay bridge | `window.postMessage` both ways (comments up; mode + theme colors down). A pin's id **is** its comment's `cid` |
 | Request model          | One queue file per *request*, holding many comments as sub-items. Comment statuses are authoritative; the request's status is derived from them |
 | Per-app scoping        | Each request carries `projectId` + `projectRoot`; the panel shows only the previewed app's requests, and numbering is derived per project (not a global counter) |
@@ -170,13 +178,14 @@ poke-and-prose/
 ├── plugins/
 │   ├── babel-plugin-kiro-source.js
 │   └── vite-plugin-kiro-source.js ← optional dev-time source mapping for Vite apps
-├── tests/                         ← 12 suites, run them all with tests/run-all.sh
+├── tests/                         ← 13 suites, run them all with tests/run-all.sh
 │   ├── test_batch_model.py        ← the request/comment model, end to end
 │   ├── test_project_classify.py   ← static vs needs-a-dev-server, per lockfile
 │   ├── test_toolchain_path.py     ← finding npm when PATH lacks it
 │   ├── test_bundler_template.py   ← .tsx entry detection (blank-page guard)
 │   ├── test_detect_dev_server.py  ← port → pid → cwd matching
 │   ├── test_dev_proxy.py          ← overlay injection + transparency + 502s
+│   ├── test_pin_anchor.mjs        ← pins surviving add/delete of their element
 │   ├── audit_host_classes.py      ← Tailwind classes the host bundle lacks
 │   └── migrate_to_batch.py        ← one-shot migration for pre-0.7.0 queue files
 └── ui/index.mjs                   ← dashboard page (federated ESM, no build step)
